@@ -170,7 +170,12 @@ fn parse_superscript(reader: &mut Reader<&[u8]>, out: &mut String) {
         }
     }
 
-    out.push_str(&base);
+    // Empty base needs a placeholder to avoid bare `^` in Typst math
+    if base.is_empty() {
+        out.push_str("\"\"");
+    } else {
+        out.push_str(&base);
+    }
     let _ = std::fmt::Write::write_fmt(out, format_args!("^{}", wrap_if_needed(&sup)));
 }
 
@@ -192,7 +197,12 @@ fn parse_subscript(reader: &mut Reader<&[u8]>, out: &mut String) {
         }
     }
 
-    out.push_str(&base);
+    // Empty base needs a placeholder to avoid bare `_` in Typst math
+    if base.is_empty() {
+        out.push_str("\"\"");
+    } else {
+        out.push_str(&base);
+    }
     let _ = std::fmt::Write::write_fmt(out, format_args!("_{}", wrap_if_needed(&sub)));
 }
 
@@ -216,7 +226,12 @@ fn parse_sub_superscript(reader: &mut Reader<&[u8]>, out: &mut String) {
         }
     }
 
-    out.push_str(&base);
+    // Empty base needs a placeholder to avoid bare `_` in Typst math
+    if base.is_empty() {
+        out.push_str("\"\"");
+    } else {
+        out.push_str(&base);
+    }
     let _ = std::fmt::Write::write_fmt(
         out,
         format_args!("_{}^{}", wrap_if_needed(&sub), wrap_if_needed(&sup)),
@@ -459,7 +474,16 @@ fn map_math_text(input: &str) -> String {
                 flush_non_ascii_text(&mut result, &non_ascii_buf, &mut last_was_name);
                 non_ascii_buf.clear();
             }
-            result.push(ch);
+            // Parentheses from <m:t> are literal characters, not Typst math
+            // grouping. Quote them to prevent breaking function call syntax
+            // (e.g., `sqrt()` when radicand contains `)` from OMML text).
+            if ch == '(' || ch == ')' {
+                result.push('"');
+                result.push(ch);
+                result.push('"');
+            } else {
+                result.push(ch);
+            }
             last_was_name = false;
         }
     }
@@ -1534,5 +1558,62 @@ mod tests {
         // Single non-ASCII char that maps to a Typst symbol should pass through
         let xml = r#"<m:r><m:t>α</m:t></m:r>"#;
         assert_eq!(omml_to_typst(xml), "alpha");
+    }
+
+    // --- US-380: subscript/superscript with empty base ---
+
+    #[test]
+    fn test_subscript_empty_base() {
+        // When base is empty (e.g., <m:e/> or <m:e></m:e>), the output must
+        // not start with bare `_` which is invalid in Typst math.
+        let xml = r#"<m:sSub><m:e></m:e><m:sub><m:r><m:t>2</m:t></m:r></m:sub></m:sSub>"#;
+        let result = omml_to_typst(xml);
+        assert!(
+            !result.starts_with('_'),
+            "Empty base subscript must not start with bare '_': got '{result}'"
+        );
+        assert!(
+            result.contains("_2"),
+            "Should still contain subscript: got '{result}'"
+        );
+    }
+
+    #[test]
+    fn test_superscript_empty_base() {
+        let xml = r#"<m:sSup><m:e></m:e><m:sup><m:r><m:t>1</m:t></m:r></m:sup></m:sSup>"#;
+        let result = omml_to_typst(xml);
+        assert!(
+            !result.starts_with('^'),
+            "Empty base superscript must not start with bare '^': got '{result}'"
+        );
+        assert!(
+            result.contains("^1"),
+            "Should still contain superscript: got '{result}'"
+        );
+    }
+
+    #[test]
+    fn test_sub_superscript_empty_base() {
+        let xml = r#"<m:sSubSup><m:e></m:e><m:sub><m:r><m:t>2</m:t></m:r></m:sub><m:sup><m:r><m:t>1</m:t></m:r></m:sup></m:sSubSup>"#;
+        let result = omml_to_typst(xml);
+        assert!(
+            !result.starts_with('_'),
+            "Empty base sub-superscript must not start with bare '_': got '{result}'"
+        );
+    }
+
+    // --- US-381: literal parens in math run text ---
+
+    #[test]
+    fn test_math_text_literal_parens() {
+        // Literal ( and ) in <m:t> should not break Typst math function calls
+        let xml = r#"<m:rad><m:radPr><m:degHide m:val="on"/></m:radPr><m:deg/><m:e><m:r><m:t>)2(</m:t></m:r></m:e></m:rad>"#;
+        let result = omml_to_typst(xml);
+        // Must produce valid Typst: sqrt() must have its radicand argument
+        // The result must not be "sqrt()2()" which would fail compilation
+        assert!(
+            !result.contains("sqrt()"),
+            "Literal parens in radicand must not produce empty sqrt(): got '{result}'"
+        );
     }
 }

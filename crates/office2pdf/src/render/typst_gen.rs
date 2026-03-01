@@ -1730,7 +1730,21 @@ fn generate_run(out: &mut String, run: &Run) {
         out.push_str(&escaped);
         out.push(']');
     } else {
-        out.push_str(&escaped);
+        // Prevent `](` pattern: when previous output ends with an
+        // unescaped `]` and this text starts with `(`, `.`, or `[`,
+        // Typst would interpret it as function arguments / method call /
+        // trailing content.  Wrap in `#[...]` to keep it in content mode.
+        let needs_wrap = !escaped.is_empty()
+            && out.ends_with(']')
+            && !out.ends_with("\\]")
+            && matches!(escaped.as_bytes()[0], b'(' | b'.' | b'[');
+        if needs_wrap {
+            out.push_str("#[");
+            out.push_str(&escaped);
+            out.push(']');
+        } else {
+            out.push_str(&escaped);
+        }
     }
 
     if needs_underline {
@@ -6779,6 +6793,46 @@ mod tests {
             output.source.contains("gradient.linear"),
             "Two-stop gradient should still produce gradient.linear: {}",
             output.source,
+        );
+    }
+
+    // --- US-382/383: unstyled run after styled run must not create `](` pattern ---
+
+    #[test]
+    fn test_unstyled_run_with_parens_after_styled_run() {
+        // When a styled run is followed by an unstyled run starting with `(`,
+        // the `](` pattern must not be interpreted as Typst function arguments.
+        let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+            style: ParagraphStyle::default(),
+            runs: vec![
+                Run {
+                    text: "bold text".to_string(),
+                    style: TextStyle {
+                        bold: Some(true),
+                        ..TextStyle::default()
+                    },
+                    href: None,
+                    footnote: None,
+                },
+                Run {
+                    text: "(parenthetical note)".to_string(),
+                    style: TextStyle::default(),
+                    href: None,
+                    footnote: None,
+                },
+            ],
+        })])]);
+        let result = generate_typst(&doc).unwrap().source;
+        // The result must not contain `](` directly — it would be interpreted
+        // as function arguments in Typst
+        assert!(
+            !result.contains("](\\(") || !result.contains("]("),
+            "Unstyled text with parens after styled run must be wrapped safely. Got: {result}"
+        );
+        // Verify the output uses #[...] wrapper or other safe pattern
+        assert!(
+            result.contains("#[") || result.contains("\\("),
+            "Unstyled text should be wrapped in #[...] to prevent syntax issues. Got: {result}"
         );
     }
 }
