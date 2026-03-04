@@ -9,7 +9,9 @@ use crate::ir::{
     Color, ColumnLayout, Document, FixedElement, FixedElementKind, FixedPage, FloatingImage,
     FlowPage, GradientFill, HFInline, HeaderFooter, ImageData, ImageFormat, LineSpacing, List,
     ListKind, Margins, MathEquation, Metadata, Page, PageSize, Paragraph, ParagraphStyle, Run,
-    Shadow, Shape, ShapeKind, SmartArt, Table, TableCell, TablePage, TextDirection, TextStyle,
+    ShapeKind, SmartArt, TabStop, Table, TableCell, TablePage, TextDirection, TextStyle,
+    Shadow, Shape, ShapeKind, SmartArt, TabStop, Table, TableCell, TablePage, TextDirection,
+    TextStyle,
     VerticalTextAlign, WrapMode,
 };
 
@@ -1684,9 +1686,17 @@ fn generate_paragraph(out: &mut String, para: &Paragraph) -> Result<(), ConvertE
         let _ = write!(out, "#align({align_str})[");
     }
 
-    // Generate runs
+    // Generate runs, replacing tab characters with #h() spacing
+    let mut tab_index: usize = 0;
+    let mut tab_cursor_pt: f64 = 0.0;
     for run in &para.runs {
-        generate_run(out, run);
+        generate_run_with_tabs(
+            out,
+            run,
+            style.tab_stops.as_deref(),
+            &mut tab_index,
+            &mut tab_cursor_pt,
+        );
     }
 
     if use_align {
@@ -1739,6 +1749,67 @@ fn write_par_settings(out: &mut String, style: &ParagraphStyle) {
     if matches!(style.direction, Some(TextDirection::Rtl)) {
         out.push_str("  #set text(dir: rtl)\n");
     }
+}
+
+/// Word's default tab stop interval (0.5 inch = 36pt).
+const DEFAULT_TAB_WIDTH_PT: f64 = 36.0;
+
+/// Generate a run, replacing tab characters with `#h()` spacing based on tab stops.
+fn generate_run_with_tabs(
+    out: &mut String,
+    run: &Run,
+    tab_stops: Option<&[TabStop]>,
+    tab_index: &mut usize,
+    tab_cursor_pt: &mut f64,
+) {
+    if !run.text.contains('\t') {
+        generate_run(out, run);
+        return;
+    }
+
+    // Split text at tab boundaries and emit #h() for each tab
+    let parts: Vec<&str> = run.text.split('\t').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            // Emit tab spacing
+            let width: f64 = resolve_tab_advance(tab_stops, tab_index, tab_cursor_pt);
+            let _ = write!(out, "#h({}pt)", format_f64(width));
+        }
+        if !part.is_empty() {
+            let sub_run = Run {
+                text: part.to_string(),
+                style: run.style.clone(),
+                href: run.href.clone(),
+                footnote: None,
+            };
+            generate_run(out, &sub_run);
+        }
+    }
+}
+
+/// Resolve tab width as a relative advance from the current tab cursor.
+fn resolve_tab_advance(
+    tab_stops: Option<&[TabStop]>,
+    tab_index: &mut usize,
+    tab_cursor_pt: &mut f64,
+) -> f64 {
+    let width: f64 = tab_stops
+        .and_then(|stops| {
+            if *tab_index >= stops.len() {
+                return None;
+            }
+            let stop_position = stops[*tab_index].position;
+            *tab_index += 1;
+            if stop_position > *tab_cursor_pt {
+                Some(stop_position - *tab_cursor_pt)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(DEFAULT_TAB_WIDTH_PT);
+
+    *tab_cursor_pt += width;
+    width
 }
 
 fn generate_run(out: &mut String, run: &Run) {
@@ -2276,6 +2347,93 @@ mod tests {
         assert!(
             result.contains("tracking: -0.5pt"),
             "Expected negative tracking in: {result}"
+        );
+    }
+
+    #[test]
+    fn test_generate_tab_with_default_spacing() {
+        let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+            style: ParagraphStyle::default(),
+            runs: vec![Run {
+                text: "Name:\tValue".to_string(),
+                style: TextStyle::default(),
+                href: None,
+                footnote: None,
+            }],
+        })])]);
+        let result = generate_typst(&doc).unwrap().source;
+        assert!(
+            result.contains("Name:") && result.contains("#h(36pt)") && result.contains("Value"),
+            "Expected default tab spacing in: {result}"
+        );
+    }
+
+    #[test]
+    fn test_generate_tab_with_custom_tab_stops() {
+        use crate::ir::{TabAlignment, TabLeader, TabStop};
+
+        let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+            style: ParagraphStyle {
+                tab_stops: Some(vec![
+                    TabStop {
+                        position: 72.0,
+                        alignment: TabAlignment::Left,
+                        leader: TabLeader::None,
+                    },
+                    TabStop {
+                        position: 216.0,
+                        alignment: TabAlignment::Right,
+                        leader: TabLeader::Dot,
+                    },
+                ]),
+                ..ParagraphStyle::default()
+            },
+            runs: vec![Run {
+                text: "Col1\tCol2\tCol3".to_string(),
+                style: TextStyle::default(),
+                href: None,
+                footnote: None,
+            }],
+        })])]);
+        let result = generate_typst(&doc).unwrap().source;
+        assert!(
+            result.contains("#h(72pt)"),
+            "Expected first tab stop at 72pt in: {result}"
+        );
+        assert!(
+            result.contains("#h(144pt)"),
+            "Expected second tab to advance by 144pt to the 216pt stop in: {result}"
+        );
+    }
+
+    #[test]
+    fn test_generate_tab_exceeds_defined_stops() {
+        use crate::ir::{TabAlignment, TabLeader, TabStop};
+
+        let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+            style: ParagraphStyle {
+                tab_stops: Some(vec![TabStop {
+                    position: 100.0,
+                    alignment: TabAlignment::Left,
+                    leader: TabLeader::None,
+                }]),
+                ..ParagraphStyle::default()
+            },
+            runs: vec![Run {
+                text: "A\tB\tC".to_string(),
+                style: TextStyle::default(),
+                href: None,
+                footnote: None,
+            }],
+        })])]);
+        let result = generate_typst(&doc).unwrap().source;
+        assert!(
+            result.contains("#h(100pt)"),
+            "Expected first tab at 100pt in: {result}"
+        );
+        assert!(
+            result.contains("#h(36pt)"),
+            "Expected fallback tab at 36pt in: {result}"
         );
     }
 

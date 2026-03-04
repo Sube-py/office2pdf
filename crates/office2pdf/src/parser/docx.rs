@@ -9,11 +9,12 @@ use crate::error::{ConvertError, ConvertWarning};
 /// truncated to prevent stack overflow on pathological documents.
 const MAX_TABLE_DEPTH: usize = 64;
 use crate::ir::{
-    Alignment, Block, BorderLineStyle, BorderSide, CellBorder, CellVerticalAlign, Chart, Color,
-    ColumnLayout, Document, FloatingImage, FlowPage, HFInline, HeaderFooter, HeaderFooterParagraph,
-    ImageData, ImageFormat, LineSpacing, List, ListItem, ListKind, Margins, MathEquation, Page,
-    PageSize, Paragraph, ParagraphStyle, Run, StyleSheet, Table, TableCell, TableRow,
-    TextDirection, TextStyle, VerticalTextAlign, WrapMode,
+    Alignment, Block, BorderLineStyle, BorderSide, CellBorder, Chart, Color, ColumnLayout,
+    Document, FloatingImage, FlowPage, HFInline, HeaderFooter, HeaderFooterParagraph, ImageData,
+    ImageFormat, LineSpacing, List, ListItem, ListKind, Margins, MathEquation, Page, PageSize,
+    Paragraph, ParagraphStyle, Run, StyleSheet, TabAlignment, TabLeader, TabStop, Table,
+    TableCell, TableRow, TextDirection, TextStyle, VerticalTextAlign, WrapMode,
+    CellVerticalAlign,
 };
 use crate::parser::Parser;
 
@@ -253,6 +254,7 @@ fn merge_paragraph_style(
             .and_then(|s| s.heading_level)
             .map(|lvl| (lvl + 1) as u8),
         direction: explicit.direction,
+        tab_stops: explicit.tab_stops.clone().or(style_para.tab_stops.clone()),
     }
 }
 
@@ -1706,6 +1708,8 @@ fn extract_paragraph_style(prop: &docx_rs::ParagraphProperty) -> ParagraphStyle 
 
     let (line_spacing, space_before, space_after) = extract_line_spacing(&prop.line_spacing);
 
+    let tab_stops = extract_tab_stops(&prop.tabs);
+
     ParagraphStyle {
         alignment,
         indent_left,
@@ -1716,6 +1720,7 @@ fn extract_paragraph_style(prop: &docx_rs::ParagraphProperty) -> ParagraphStyle 
         space_after,
         heading_level: None,
         direction: None, // Set by BidiContext after style merge
+        tab_stops,
     }
 }
 
@@ -1773,6 +1778,52 @@ fn extract_line_spacing(
     });
 
     (line_spacing, space_before, space_after)
+}
+
+/// Extract tab stops from paragraph properties.
+/// docx-rs Tab has `pos` in twips and `val`/`leader` as enums.
+fn extract_tab_stops(tabs: &[docx_rs::Tab]) -> Option<Vec<TabStop>> {
+    if tabs.is_empty() {
+        return None;
+    }
+
+    let mut stops: Vec<TabStop> =
+        tabs.iter()
+            .filter_map(|t| {
+                let pos_twips = t.pos? as f64;
+                let position = pos_twips / 20.0; // twips → points
+
+                let alignment = match t.val {
+                    Some(docx_rs::TabValueType::Center) => TabAlignment::Center,
+                    Some(docx_rs::TabValueType::Right) | Some(docx_rs::TabValueType::End) => {
+                        TabAlignment::Right
+                    }
+                    Some(docx_rs::TabValueType::Decimal) => TabAlignment::Decimal,
+                    Some(docx_rs::TabValueType::Clear) => return None, // "clear" removes a tab stop
+                    _ => TabAlignment::Left,
+                };
+
+                let leader =
+                    match t.leader {
+                        Some(docx_rs::TabLeaderType::Dot)
+                        | Some(docx_rs::TabLeaderType::MiddleDot) => TabLeader::Dot,
+                        Some(docx_rs::TabLeaderType::Hyphen)
+                        | Some(docx_rs::TabLeaderType::Heavy) => TabLeader::Hyphen,
+                        Some(docx_rs::TabLeaderType::Underscore) => TabLeader::Underscore,
+                        _ => TabLeader::None,
+                    };
+
+                Some(TabStop {
+                    position,
+                    alignment,
+                    leader,
+                })
+            })
+            .collect();
+
+    stops.sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap());
+
+    if stops.is_empty() { None } else { Some(stops) }
 }
 
 #[allow(clippy::too_many_arguments)]
