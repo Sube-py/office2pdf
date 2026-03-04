@@ -653,6 +653,14 @@ fn unicode_to_typst(ch: char) -> Option<&'static str> {
         '⊃' => Some("supset"),
         '∪' => Some("union"),
         '∩' => Some("sect"),
+        // Blackboard bold (double-struck) letters
+        'ℂ' => Some("CC"),
+        'ℍ' => Some("HH"),
+        'ℕ' => Some("NN"),
+        'ℙ' => Some("PP"),
+        'ℚ' => Some("QQ"),
+        'ℝ' => Some("RR"),
+        'ℤ' => Some("ZZ"),
         _ => None,
     }
 }
@@ -1615,5 +1623,31 @@ mod tests {
             !result.contains("sqrt()"),
             "Literal parens in radicand must not produce empty sqrt(): got '{result}'"
         );
+    }
+
+    // --- Blackboard bold letter mappings ---
+
+    #[test]
+    fn test_blackboard_bold_letters() {
+        assert_eq!(unicode_to_typst('ℂ'), Some("CC"));
+        assert_eq!(unicode_to_typst('ℍ'), Some("HH"));
+        assert_eq!(unicode_to_typst('ℕ'), Some("NN"));
+        assert_eq!(unicode_to_typst('ℙ'), Some("PP"));
+        assert_eq!(unicode_to_typst('ℚ'), Some("QQ"));
+        assert_eq!(unicode_to_typst('ℝ'), Some("RR"));
+        assert_eq!(unicode_to_typst('ℤ'), Some("ZZ"));
+    }
+
+    #[test]
+    fn test_blackboard_bold_in_math_text() {
+        // Blackboard bold letters should map to Typst symbols, not be wrapped in upright()
+        assert_eq!(map_math_text("ℝ"), "RR");
+        assert_eq!(map_math_text("x∈ℝ"), "x in RR");
+    }
+
+    #[test]
+    fn test_blackboard_bold_via_omml() {
+        let xml = r#"<m:r><m:t>ℝ</m:t></m:r>"#;
+        assert_eq!(omml_to_typst(xml), "RR");
     }
 }
