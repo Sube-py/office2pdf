@@ -653,6 +653,19 @@ fn unicode_to_typst(ch: char) -> Option<&'static str> {
         '⊃' => Some("supset"),
         '∪' => Some("union"),
         '∩' => Some("sect"),
+        // Arrows
+        '←' => Some("arrow.l"),
+        '↑' => Some("arrow.t"),
+        '→' => Some("arrow.r"),
+        '↓' => Some("arrow.b"),
+        '↔' => Some("arrow.l.r"),
+        '↦' => Some("arrow.r.bar"),
+        '↪' => Some("arrow.r.hook"),
+        '↼' => Some("harpoon.lt"),
+        '⇀' => Some("harpoon.rt"),
+        '⇐' => Some("arrow.l.double"),
+        '⇒' => Some("arrow.r.double"),
+        '⇔' => Some("arrow.l.r.double"),
         // Extended relations
         '≡' => Some("equiv"),
         '∼' => Some("tilde.op"),
@@ -1682,5 +1695,29 @@ mod tests {
     fn test_extended_relations_in_math_text() {
         assert_eq!(map_math_text("a≡b"), "a equiv b");
         assert_eq!(map_math_text("A⊆B"), "A subset.eq B");
+    }
+
+    // --- Arrow symbol mappings ---
+
+    #[test]
+    fn test_arrow_symbols() {
+        assert_eq!(unicode_to_typst('←'), Some("arrow.l"));
+        assert_eq!(unicode_to_typst('↑'), Some("arrow.t"));
+        assert_eq!(unicode_to_typst('→'), Some("arrow.r"));
+        assert_eq!(unicode_to_typst('↓'), Some("arrow.b"));
+        assert_eq!(unicode_to_typst('↔'), Some("arrow.l.r"));
+        assert_eq!(unicode_to_typst('↦'), Some("arrow.r.bar"));
+        assert_eq!(unicode_to_typst('↪'), Some("arrow.r.hook"));
+        assert_eq!(unicode_to_typst('↼'), Some("harpoon.lt"));
+        assert_eq!(unicode_to_typst('⇀'), Some("harpoon.rt"));
+        assert_eq!(unicode_to_typst('⇐'), Some("arrow.l.double"));
+        assert_eq!(unicode_to_typst('⇒'), Some("arrow.r.double"));
+        assert_eq!(unicode_to_typst('⇔'), Some("arrow.l.r.double"));
+    }
+
+    #[test]
+    fn test_arrow_in_math_text() {
+        assert_eq!(map_math_text("x→y"), "x arrow.r y");
+        assert_eq!(map_math_text("A⇒B"), "A arrow.r.double B");
     }
 }
