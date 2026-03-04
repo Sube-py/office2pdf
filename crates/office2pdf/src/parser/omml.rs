@@ -890,6 +890,10 @@ fn map_accent(chr: &str) -> &str {
         "\u{0307}" | "\u{02D9}" => "dot",
         "\u{0308}" | "\u{00A8}" => "dot.double",
         "\u{20D7}" | "\u{2192}" => "arrow",
+        "\u{0301}" => "acute",
+        "\u{0300}" => "grave",
+        "\u{0305}" => "macron",
+        "\u{030A}" => "circle",
         "\u{030C}" => "caron",
         "\u{0306}" => "breve",
         _ => "hat",
@@ -1785,5 +1789,27 @@ mod tests {
     fn test_ceiling_delimiter_via_omml() {
         let xml = r#"<m:d><m:dPr><m:begChr m:val="⌈"/><m:endChr m:val="⌉"/></m:dPr><m:e><m:r><m:t>x</m:t></m:r></m:e></m:d>"#;
         assert_eq!(omml_to_typst(xml), "⌈x⌉");
+    }
+
+    // --- Extended accent mappings ---
+
+    #[test]
+    fn test_extended_accents() {
+        assert_eq!(map_accent("\u{0301}"), "acute");
+        assert_eq!(map_accent("\u{0300}"), "grave");
+        assert_eq!(map_accent("\u{0305}"), "macron");
+        assert_eq!(map_accent("\u{030A}"), "circle");
+    }
+
+    #[test]
+    fn test_acute_accent_via_omml() {
+        let xml = r#"<m:acc><m:accPr><m:chr m:val="́"/></m:accPr><m:e><m:r><m:t>a</m:t></m:r></m:e></m:acc>"#;
+        assert_eq!(omml_to_typst(xml), "acute(a)");
+    }
+
+    #[test]
+    fn test_grave_accent_via_omml() {
+        let xml = r#"<m:acc><m:accPr><m:chr m:val="̀"/></m:accPr><m:e><m:r><m:t>a</m:t></m:r></m:e></m:acc>"#;
+        assert_eq!(omml_to_typst(xml), "grave(a)");
     }
 }
