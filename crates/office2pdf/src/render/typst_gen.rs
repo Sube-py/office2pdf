@@ -5,12 +5,12 @@ use unicode_normalization::UnicodeNormalization;
 use crate::config::ConvertOptions;
 use crate::error::ConvertError;
 use crate::ir::{
-    Alignment, Block, BorderLineStyle, BorderSide, CellBorder, Chart, ChartType, Color,
-    ColumnLayout, Document, FixedElement, FixedElementKind, FixedPage, FloatingImage, FlowPage,
-    GradientFill, HFInline, HeaderFooter, ImageData, ImageFormat, LineSpacing, List, ListKind,
-    Margins, MathEquation, Metadata, Page, PageSize, Paragraph, ParagraphStyle, Run, Shadow, Shape,
-    ShapeKind, SmartArt, Table, TableCell, TablePage, TextDirection, TextStyle, VerticalTextAlign,
-    WrapMode,
+    Alignment, Block, BorderLineStyle, BorderSide, CellBorder, CellVerticalAlign, Chart, ChartType,
+    Color, ColumnLayout, Document, FixedElement, FixedElementKind, FixedPage, FloatingImage,
+    FlowPage, GradientFill, HFInline, HeaderFooter, ImageData, ImageFormat, LineSpacing, List,
+    ListKind, Margins, MathEquation, Metadata, Page, PageSize, Paragraph, ParagraphStyle, Run,
+    Shadow, Shape, ShapeKind, SmartArt, Table, TableCell, TablePage, TextDirection, TextStyle,
+    VerticalTextAlign, WrapMode,
 };
 
 /// An image asset to be embedded in the Typst compilation.
@@ -1380,7 +1380,8 @@ fn generate_table_cell(
     let needs_cell_fn = clamped_colspan > 1
         || cell.row_span > 1
         || cell.border.is_some()
-        || cell.background.is_some();
+        || cell.background.is_some()
+        || cell.vertical_align.is_some();
 
     if needs_cell_fn {
         out.push_str("  table.cell(");
@@ -1432,6 +1433,14 @@ fn write_cell_params(out: &mut String, cell: &TableCell, clamped_colspan: u32) {
         if !stroke.is_empty() {
             write_param(out, &mut first, &stroke);
         }
+    }
+    if let Some(ref va) = cell.vertical_align {
+        let align_str: &str = match va {
+            CellVerticalAlign::Top => "top",
+            CellVerticalAlign::Center => "horizon",
+            CellVerticalAlign::Bottom => "bottom",
+        };
+        write_param(out, &mut first, &format!("align: {align_str}"));
     }
 }
 
@@ -7028,6 +7037,35 @@ mod tests {
     }
 
     #[test]
+    fn test_table_cell_vertical_align_center() {
+        let table = Table {
+            rows: vec![TableRow {
+                cells: vec![TableCell {
+                    content: vec![Block::Paragraph(Paragraph {
+                        style: ParagraphStyle::default(),
+                        runs: vec![Run {
+                            text: "Centered".to_string(),
+                            style: TextStyle::default(),
+                            href: None,
+                            footnote: None,
+                        }],
+                    })],
+                    vertical_align: Some(CellVerticalAlign::Center),
+                    ..TableCell::default()
+                }],
+                height: None,
+            }],
+            column_widths: vec![100.0],
+        };
+        let doc = make_doc(vec![make_flow_page(vec![Block::Table(table)])]);
+        let result = generate_typst(&doc).unwrap().source;
+        assert!(
+            result.contains("align: horizon"),
+            "Center vertical alignment should emit 'align: horizon'. Got: {result}"
+        );
+    }
+
+    #[test]
     fn test_generate_run_highlight_with_bold() {
         let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
             style: ParagraphStyle::default(),
@@ -7050,6 +7088,35 @@ mod tests {
         assert!(
             result.contains("weight: \"bold\""),
             "Should have bold text. Got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_table_cell_vertical_align_bottom() {
+        let table = Table {
+            rows: vec![TableRow {
+                cells: vec![TableCell {
+                    content: vec![Block::Paragraph(Paragraph {
+                        style: ParagraphStyle::default(),
+                        runs: vec![Run {
+                            text: "Bottom".to_string(),
+                            style: TextStyle::default(),
+                            href: None,
+                            footnote: None,
+                        }],
+                    })],
+                    vertical_align: Some(CellVerticalAlign::Bottom),
+                    ..TableCell::default()
+                }],
+                height: None,
+            }],
+            column_widths: vec![100.0],
+        };
+        let doc = make_doc(vec![make_flow_page(vec![Block::Table(table)])]);
+        let result = generate_typst(&doc).unwrap().source;
+        assert!(
+            result.contains("align: bottom"),
+            "Bottom vertical alignment should emit 'align: bottom'. Got: {result}"
         );
     }
 }

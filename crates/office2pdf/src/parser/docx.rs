@@ -9,11 +9,11 @@ use crate::error::{ConvertError, ConvertWarning};
 /// truncated to prevent stack overflow on pathological documents.
 const MAX_TABLE_DEPTH: usize = 64;
 use crate::ir::{
-    Alignment, Block, BorderLineStyle, BorderSide, CellBorder, Chart, Color, ColumnLayout,
-    Document, FloatingImage, FlowPage, HFInline, HeaderFooter, HeaderFooterParagraph, ImageData,
-    ImageFormat, LineSpacing, List, ListItem, ListKind, Margins, MathEquation, Page, PageSize,
-    Paragraph, ParagraphStyle, Run, StyleSheet, Table, TableCell, TableRow, TextDirection,
-    TextStyle, VerticalTextAlign, WrapMode,
+    Alignment, Block, BorderLineStyle, BorderSide, CellBorder, CellVerticalAlign, Chart, Color,
+    ColumnLayout, Document, FloatingImage, FlowPage, HFInline, HeaderFooter, HeaderFooterParagraph,
+    ImageData, ImageFormat, LineSpacing, List, ListItem, ListKind, Margins, MathEquation, Page,
+    PageSize, Paragraph, ParagraphStyle, Run, StyleSheet, Table, TableCell, TableRow,
+    TextDirection, TextStyle, VerticalTextAlign, WrapMode,
 };
 use crate::parser::Parser;
 
@@ -1816,6 +1816,7 @@ struct RawCell {
     vmerge: Option<String>, // "restart", "continue", or None
     border: Option<CellBorder>,
     background: Option<Color>,
+    vertical_align: Option<CellVerticalAlign>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1866,6 +1867,16 @@ fn extract_raw_rows(
                 .and_then(|j| j.get("shading"))
                 .and_then(extract_cell_shading);
 
+            let vertical_align: Option<CellVerticalAlign> = prop_json
+                .as_ref()
+                .and_then(|j| j.get("verticalAlign"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| match s {
+                    "center" => Some(CellVerticalAlign::Center),
+                    "bottom" => Some(CellVerticalAlign::Bottom),
+                    _ => None, // "top" is default, skip
+                });
+
             cells.push(RawCell {
                 content,
                 col_span: grid_span,
@@ -1873,6 +1884,7 @@ fn extract_raw_rows(
                 vmerge,
                 border,
                 background,
+                vertical_align,
             });
 
             col_index += grid_span as usize;
@@ -1908,6 +1920,7 @@ fn resolve_vmerge_and_build_rows(raw_rows: &[Vec<RawCell>]) -> Vec<TableRow> {
                         background: raw_cell.background,
                         data_bar: None,
                         icon_text: None,
+                        vertical_align: raw_cell.vertical_align,
                     });
                 }
                 _ => {
@@ -1920,6 +1933,7 @@ fn resolve_vmerge_and_build_rows(raw_rows: &[Vec<RawCell>]) -> Vec<TableRow> {
                         background: raw_cell.background,
                         data_bar: None,
                         icon_text: None,
+                        vertical_align: raw_cell.vertical_align,
                     });
                 }
             }

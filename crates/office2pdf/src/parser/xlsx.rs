@@ -964,6 +964,7 @@ fn build_rows_for_range(
                 background,
                 data_bar,
                 icon_text,
+                vertical_align: None,
             });
         }
 

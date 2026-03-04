@@ -172,6 +172,14 @@ pub struct DataBarInfo {
     pub fill_pct: f64,
 }
 
+/// Vertical alignment within a table cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellVerticalAlign {
+    Top,
+    Center,
+    Bottom,
+}
+
 /// A table cell.
 #[derive(Debug, Clone)]
 pub struct TableCell {
@@ -184,6 +192,8 @@ pub struct TableCell {
     pub data_bar: Option<DataBarInfo>,
     /// IconSet text symbol prepended to cell content.
     pub icon_text: Option<String>,
+    /// Vertical alignment of cell content.
+    pub vertical_align: Option<CellVerticalAlign>,
 }
 
 impl Default for TableCell {
@@ -196,6 +206,7 @@ impl Default for TableCell {
             background: None,
             data_bar: None,
             icon_text: None,
+            vertical_align: None,
         }
     }
 }
