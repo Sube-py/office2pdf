@@ -327,6 +327,8 @@ fn map_delimiter(chr: &str) -> &str {
         "\u{2016}" | "||" => "\u{2016}",
         "\u{27E8}" | "<" => "\u{27E8}",
         "\u{27E9}" | ">" => "\u{27E9}",
+        // Floor/ceiling delimiters — explicit arms for regression safety
+        "\u{2308}" | "\u{2309}" | "\u{230A}" | "\u{230B}" => chr,
         _ => chr,
     }
 }
@@ -653,6 +655,53 @@ fn unicode_to_typst(ch: char) -> Option<&'static str> {
         '⊃' => Some("supset"),
         '∪' => Some("union"),
         '∩' => Some("sect"),
+        // Additional operators
+        '∠' => Some("angle"),
+        '∧' => Some("and"),
+        '∨' => Some("or"),
+        '∘' => Some("compose"),
+        '⋅' => Some("dot.op"),
+        '∓' => Some("minus.plus"),
+        '¬' => Some("not"),
+        '⊕' => Some("plus.circle"),
+        '⊗' => Some("times.circle"),
+        '⊙' => Some("dot.circle"),
+        '⊢' => Some("tack.r"),
+        '⊣' => Some("tack.l"),
+        '⊤' => Some("top"),
+        '⊥' => Some("perp"),
+        // Arrows
+        '←' => Some("arrow.l"),
+        '↑' => Some("arrow.t"),
+        '→' => Some("arrow.r"),
+        '↓' => Some("arrow.b"),
+        '↔' => Some("arrow.l.r"),
+        '↦' => Some("arrow.r.bar"),
+        '↪' => Some("arrow.r.hook"),
+        '↼' => Some("harpoon.lt"),
+        '⇀' => Some("harpoon.rt"),
+        '⇐' => Some("arrow.l.double"),
+        '⇒' => Some("arrow.r.double"),
+        '⇔' => Some("arrow.l.r.double"),
+        // Extended relations
+        '≡' => Some("equiv"),
+        '∼' => Some("tilde.op"),
+        '≅' => Some("tilde.eq"),
+        '≪' => Some("lt.double"),
+        '≫' => Some("gt.double"),
+        '⊆' => Some("subset.eq"),
+        '⊇' => Some("supset.eq"),
+        '∝' => Some("prop"),
+        '∴' => Some("therefore"),
+        '∵' => Some("because"),
+        // Blackboard bold (double-struck) letters
+        'ℂ' => Some("CC"),
+        'ℍ' => Some("HH"),
+        'ℕ' => Some("NN"),
+        'ℙ' => Some("PP"),
+        'ℚ' => Some("QQ"),
+        'ℝ' => Some("RR"),
+        'ℤ' => Some("ZZ"),
         _ => None,
     }
 }
@@ -721,6 +770,9 @@ fn map_nary_operator(chr: &str) -> &str {
         "\u{222E}" => "integral.cont",
         "\u{22C3}" => "union.big",
         "\u{22C2}" => "sect.big",
+        "\u{2210}" => "product.co",
+        "\u{22C0}" => "and.big",
+        "\u{22C1}" => "or.big",
         _ => "sum",
     }
 }
@@ -841,6 +893,10 @@ fn map_accent(chr: &str) -> &str {
         "\u{0307}" | "\u{02D9}" => "dot",
         "\u{0308}" | "\u{00A8}" => "dot.double",
         "\u{20D7}" | "\u{2192}" => "arrow",
+        "\u{0301}" => "acute",
+        "\u{0300}" => "grave",
+        "\u{0305}" => "macron",
+        "\u{030A}" => "circle",
         "\u{030C}" => "caron",
         "\u{0306}" => "breve",
         _ => "hat",
@@ -1615,5 +1671,169 @@ mod tests {
             !result.contains("sqrt()"),
             "Literal parens in radicand must not produce empty sqrt(): got '{result}'"
         );
+    }
+
+    // --- Blackboard bold letter mappings ---
+
+    #[test]
+    fn test_blackboard_bold_letters() {
+        assert_eq!(unicode_to_typst('ℂ'), Some("CC"));
+        assert_eq!(unicode_to_typst('ℍ'), Some("HH"));
+        assert_eq!(unicode_to_typst('ℕ'), Some("NN"));
+        assert_eq!(unicode_to_typst('ℙ'), Some("PP"));
+        assert_eq!(unicode_to_typst('ℚ'), Some("QQ"));
+        assert_eq!(unicode_to_typst('ℝ'), Some("RR"));
+        assert_eq!(unicode_to_typst('ℤ'), Some("ZZ"));
+    }
+
+    #[test]
+    fn test_blackboard_bold_in_math_text() {
+        // Blackboard bold letters should map to Typst symbols, not be wrapped in upright()
+        assert_eq!(map_math_text("ℝ"), "RR");
+        assert_eq!(map_math_text("x∈ℝ"), "x in RR");
+    }
+
+    #[test]
+    fn test_blackboard_bold_via_omml() {
+        let xml = r#"<m:r><m:t>ℝ</m:t></m:r>"#;
+        assert_eq!(omml_to_typst(xml), "RR");
+    }
+
+    // --- Extended relation symbol mappings ---
+
+    #[test]
+    fn test_extended_relations() {
+        assert_eq!(unicode_to_typst('≡'), Some("equiv"));
+        assert_eq!(unicode_to_typst('∼'), Some("tilde.op"));
+        assert_eq!(unicode_to_typst('≅'), Some("tilde.eq"));
+        assert_eq!(unicode_to_typst('≪'), Some("lt.double"));
+        assert_eq!(unicode_to_typst('≫'), Some("gt.double"));
+        assert_eq!(unicode_to_typst('⊆'), Some("subset.eq"));
+        assert_eq!(unicode_to_typst('⊇'), Some("supset.eq"));
+        assert_eq!(unicode_to_typst('∝'), Some("prop"));
+        assert_eq!(unicode_to_typst('∴'), Some("therefore"));
+        assert_eq!(unicode_to_typst('∵'), Some("because"));
+    }
+
+    #[test]
+    fn test_extended_relations_in_math_text() {
+        assert_eq!(map_math_text("a≡b"), "a equiv b");
+        assert_eq!(map_math_text("A⊆B"), "A subset.eq B");
+    }
+
+    // --- Arrow symbol mappings ---
+
+    #[test]
+    fn test_arrow_symbols() {
+        assert_eq!(unicode_to_typst('←'), Some("arrow.l"));
+        assert_eq!(unicode_to_typst('↑'), Some("arrow.t"));
+        assert_eq!(unicode_to_typst('→'), Some("arrow.r"));
+        assert_eq!(unicode_to_typst('↓'), Some("arrow.b"));
+        assert_eq!(unicode_to_typst('↔'), Some("arrow.l.r"));
+        assert_eq!(unicode_to_typst('↦'), Some("arrow.r.bar"));
+        assert_eq!(unicode_to_typst('↪'), Some("arrow.r.hook"));
+        assert_eq!(unicode_to_typst('↼'), Some("harpoon.lt"));
+        assert_eq!(unicode_to_typst('⇀'), Some("harpoon.rt"));
+        assert_eq!(unicode_to_typst('⇐'), Some("arrow.l.double"));
+        assert_eq!(unicode_to_typst('⇒'), Some("arrow.r.double"));
+        assert_eq!(unicode_to_typst('⇔'), Some("arrow.l.r.double"));
+    }
+
+    #[test]
+    fn test_arrow_in_math_text() {
+        assert_eq!(map_math_text("x→y"), "x arrow.r y");
+        assert_eq!(map_math_text("A⇒B"), "A arrow.r.double B");
+    }
+
+    // --- Additional operator mappings ---
+
+    #[test]
+    fn test_additional_operators() {
+        assert_eq!(unicode_to_typst('∠'), Some("angle"));
+        assert_eq!(unicode_to_typst('∧'), Some("and"));
+        assert_eq!(unicode_to_typst('∨'), Some("or"));
+        assert_eq!(unicode_to_typst('∘'), Some("compose"));
+        assert_eq!(unicode_to_typst('⋅'), Some("dot.op"));
+        assert_eq!(unicode_to_typst('∓'), Some("minus.plus"));
+        assert_eq!(unicode_to_typst('¬'), Some("not"));
+        assert_eq!(unicode_to_typst('⊕'), Some("plus.circle"));
+        assert_eq!(unicode_to_typst('⊗'), Some("times.circle"));
+        assert_eq!(unicode_to_typst('⊙'), Some("dot.circle"));
+        assert_eq!(unicode_to_typst('⊢'), Some("tack.r"));
+        assert_eq!(unicode_to_typst('⊣'), Some("tack.l"));
+        assert_eq!(unicode_to_typst('⊤'), Some("top"));
+        assert_eq!(unicode_to_typst('⊥'), Some("perp"));
+    }
+
+    #[test]
+    fn test_operators_in_math_text() {
+        assert_eq!(map_math_text("a∧b"), "a and b");
+        assert_eq!(map_math_text("¬p"), "not p");
+        assert_eq!(map_math_text("f∘g"), "f compose g");
+    }
+
+    // --- Floor/ceiling delimiter tests ---
+
+    #[test]
+    fn test_floor_ceiling_delimiters() {
+        assert_eq!(map_delimiter("⌈"), "⌈");
+        assert_eq!(map_delimiter("⌉"), "⌉");
+        assert_eq!(map_delimiter("⌊"), "⌊");
+        assert_eq!(map_delimiter("⌋"), "⌋");
+    }
+
+    #[test]
+    fn test_floor_delimiter_via_omml() {
+        let xml = r#"<m:d><m:dPr><m:begChr m:val="⌊"/><m:endChr m:val="⌋"/></m:dPr><m:e><m:r><m:t>x</m:t></m:r></m:e></m:d>"#;
+        assert_eq!(omml_to_typst(xml), "⌊x⌋");
+    }
+
+    #[test]
+    fn test_ceiling_delimiter_via_omml() {
+        let xml = r#"<m:d><m:dPr><m:begChr m:val="⌈"/><m:endChr m:val="⌉"/></m:dPr><m:e><m:r><m:t>x</m:t></m:r></m:e></m:d>"#;
+        assert_eq!(omml_to_typst(xml), "⌈x⌉");
+    }
+
+    // --- Extended accent mappings ---
+
+    #[test]
+    fn test_extended_accents() {
+        assert_eq!(map_accent("\u{0301}"), "acute");
+        assert_eq!(map_accent("\u{0300}"), "grave");
+        assert_eq!(map_accent("\u{0305}"), "macron");
+        assert_eq!(map_accent("\u{030A}"), "circle");
+    }
+
+    #[test]
+    fn test_acute_accent_via_omml() {
+        let xml = r#"<m:acc><m:accPr><m:chr m:val="́"/></m:accPr><m:e><m:r><m:t>a</m:t></m:r></m:e></m:acc>"#;
+        assert_eq!(omml_to_typst(xml), "acute(a)");
+    }
+
+    #[test]
+    fn test_grave_accent_via_omml() {
+        let xml = r#"<m:acc><m:accPr><m:chr m:val="̀"/></m:accPr><m:e><m:r><m:t>a</m:t></m:r></m:e></m:acc>"#;
+        assert_eq!(omml_to_typst(xml), "grave(a)");
+    }
+
+    // --- Additional n-ary operator mappings ---
+
+    #[test]
+    fn test_additional_nary_operators() {
+        assert_eq!(map_nary_operator("\u{2210}"), "product.co");
+        assert_eq!(map_nary_operator("\u{22C0}"), "and.big");
+        assert_eq!(map_nary_operator("\u{22C1}"), "or.big");
+    }
+
+    #[test]
+    fn test_coproduct_via_omml() {
+        let xml = r#"<m:nary><m:naryPr><m:chr m:val="∐"/></m:naryPr><m:sub><m:r><m:t>i</m:t></m:r></m:sub><m:sup/><m:e><m:r><m:t>A</m:t></m:r></m:e></m:nary>"#;
+        assert_eq!(omml_to_typst(xml), "product.co_i A");
+    }
+
+    #[test]
+    fn test_big_and_via_omml() {
+        let xml = r#"<m:nary><m:naryPr><m:chr m:val="⋀"/></m:naryPr><m:sub><m:r><m:t>i</m:t></m:r></m:sub><m:sup/><m:e><m:r><m:t>p</m:t></m:r></m:e></m:nary>"#;
+        assert_eq!(omml_to_typst(xml), "and.big_i p");
     }
 }
