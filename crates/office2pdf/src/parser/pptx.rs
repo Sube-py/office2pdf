@@ -1467,6 +1467,7 @@ fn parse_pptx_table(reader: &mut Reader<&[u8]>, theme: &ThemeData) -> Result<Tab
                             background: cell_background.take(),
                             data_bar: None,
                             icon_text: None,
+                            vertical_align: None,
                         });
                         in_cell = false;
                         in_tc_pr = false;
