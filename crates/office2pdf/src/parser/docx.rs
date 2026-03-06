@@ -2681,6 +2681,20 @@ mod tests {
     }
 
     #[test]
+    fn test_letter_spacing_extracted() {
+        // docx-rs character spacing is in twips: 40 twips = 2pt
+        let data = build_docx_bytes(vec![docx_rs::Paragraph::new().add_run(
+            docx_rs::Run::new()
+                .add_text("Tracked text")
+                .character_spacing(40),
+        )]);
+        let parser = DocxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+        let run = first_run(&doc);
+        assert_eq!(run.style.letter_spacing, Some(2.0));
+    }
+
+    #[test]
     fn test_font_color_extracted() {
         let data = build_docx_bytes(vec![
             docx_rs::Paragraph::new()
@@ -2747,6 +2761,7 @@ mod tests {
         assert!(run.style.underline.is_none());
         assert!(run.style.strikethrough.is_none());
         assert!(run.style.font_size.is_none());
+        assert!(run.style.letter_spacing.is_none());
         assert!(run.style.color.is_none());
         assert!(run.style.font_family.is_none());
     }
