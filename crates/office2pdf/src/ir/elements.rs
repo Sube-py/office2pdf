@@ -180,7 +180,7 @@ pub struct Run {
 }
 
 /// A table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Table {
     pub rows: Vec<TableRow>,
     pub column_widths: Vec<f64>,
@@ -190,18 +190,6 @@ pub struct Table {
     pub alignment: Option<Alignment>,
     /// Default cell padding applied by the table when cells don't override it.
     pub default_cell_padding: Option<Insets>,
-}
-
-impl Default for Table {
-    fn default() -> Self {
-        Self {
-            rows: Vec::new(),
-            column_widths: Vec::new(),
-            header_row_count: 0,
-            alignment: None,
-            default_cell_padding: None,
-        }
-    }
 }
 
 /// A table row.
