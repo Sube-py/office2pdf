@@ -181,6 +181,56 @@ fn push_font_family(fonts: &mut BTreeSet<String>, font_family: Option<&str>) {
     }
 }
 
+fn has_font_family(font_family: Option<&str>) -> bool {
+    font_family
+        .map(str::trim)
+        .is_some_and(|font_family| !font_family.is_empty())
+}
+
+fn paragraph_requests_font_family(paragraph: &Paragraph) -> bool {
+    paragraph
+        .runs
+        .iter()
+        .any(|run| has_font_family(run.style.font_family.as_deref()))
+}
+
+fn table_requests_font_family(table: &Table) -> bool {
+    table.rows.iter().any(|row| {
+        row.cells.iter().any(|cell| {
+            cell.content
+                .iter()
+                .any(|block| block_requests_font_family(block))
+        })
+    })
+}
+
+fn header_footer_requests_font_family(header_footer: &HeaderFooter) -> bool {
+    header_footer.paragraphs.iter().any(|paragraph| {
+        paragraph.elements.iter().any(|inline| match inline {
+            HFInline::Run(run) => has_font_family(run.style.font_family.as_deref()),
+            HFInline::PageNumber | HFInline::TotalPages => false,
+        })
+    })
+}
+
+fn block_requests_font_family(block: &Block) -> bool {
+    match block {
+        Block::Paragraph(paragraph) => paragraph_requests_font_family(paragraph),
+        Block::Table(table) => table_requests_font_family(table),
+        Block::FloatingTextBox(text_box) => text_box.content.iter().any(block_requests_font_family),
+        Block::List(list) => list
+            .items
+            .iter()
+            .any(|item| item.content.iter().any(paragraph_requests_font_family)),
+        Block::Image(_)
+        | Block::FloatingImage(_)
+        | Block::MathEquation(_)
+        | Block::Chart(_)
+        | Block::PageBreak
+        | Block::ColumnBreak => false,
+    }
+}
+
 fn collect_paragraph_fonts(paragraph: &Paragraph, fonts: &mut BTreeSet<String>) {
     for run in &paragraph.runs {
         push_font_family(fonts, run.style.font_family.as_deref());
@@ -277,6 +327,39 @@ fn collect_document_font_families(doc: &Document) -> BTreeSet<String> {
     }
 
     fonts
+}
+
+pub(crate) fn document_requests_font_families(doc: &Document) -> bool {
+    doc.pages.iter().any(|page| match page {
+        Page::Flow(page) => {
+            page.header
+                .as_ref()
+                .is_some_and(header_footer_requests_font_family)
+                || page
+                    .footer
+                    .as_ref()
+                    .is_some_and(header_footer_requests_font_family)
+                || page.content.iter().any(block_requests_font_family)
+        }
+        Page::Fixed(page) => page.elements.iter().any(|element| match &element.kind {
+            FixedElementKind::TextBox(blocks) => blocks.iter().any(block_requests_font_family),
+            FixedElementKind::Table(table) => table_requests_font_family(table),
+            FixedElementKind::Image(_)
+            | FixedElementKind::Shape(_)
+            | FixedElementKind::SmartArt(_)
+            | FixedElementKind::Chart(_) => false,
+        }),
+        Page::Table(page) => {
+            page.header
+                .as_ref()
+                .is_some_and(header_footer_requests_font_family)
+                || page
+                    .footer
+                    .as_ref()
+                    .is_some_and(header_footer_requests_font_family)
+                || table_requests_font_family(&page.table)
+        }
+    })
 }
 
 fn resolve_available_fallback(font_family: &str, context: &FontSearchContext) -> Option<String> {
@@ -593,5 +676,60 @@ mod tests {
             fallbacks,
             vec![("Pretendard Medium".to_string(), "Malgun Gothic".to_string())]
         );
+    }
+
+    #[test]
+    fn test_document_requests_font_families_false_when_all_runs_use_defaults() {
+        let doc = Document {
+            metadata: crate::ir::Metadata::default(),
+            pages: vec![Page::Flow(crate::ir::FlowPage {
+                size: crate::ir::PageSize::default(),
+                margins: crate::ir::Margins::default(),
+                content: vec![Block::Paragraph(Paragraph {
+                    style: crate::ir::ParagraphStyle::default(),
+                    runs: vec![crate::ir::Run {
+                        text: "Plain text".to_string(),
+                        style: crate::ir::TextStyle::default(),
+                        href: None,
+                        footnote: None,
+                    }],
+                })],
+                header: None,
+                footer: None,
+                columns: None,
+            })],
+            styles: crate::ir::StyleSheet::default(),
+        };
+
+        assert!(!document_requests_font_families(&doc));
+    }
+
+    #[test]
+    fn test_document_requests_font_families_true_when_any_run_sets_family() {
+        let doc = Document {
+            metadata: crate::ir::Metadata::default(),
+            pages: vec![Page::Flow(crate::ir::FlowPage {
+                size: crate::ir::PageSize::default(),
+                margins: crate::ir::Margins::default(),
+                content: vec![Block::Paragraph(Paragraph {
+                    style: crate::ir::ParagraphStyle::default(),
+                    runs: vec![crate::ir::Run {
+                        text: "Styled text".to_string(),
+                        style: crate::ir::TextStyle {
+                            font_family: Some("Pretendard".to_string()),
+                            ..crate::ir::TextStyle::default()
+                        },
+                        href: None,
+                        footnote: None,
+                    }],
+                })],
+                header: None,
+                footer: None,
+                columns: None,
+            })],
+            styles: crate::ir::StyleSheet::default(),
+        };
+
+        assert!(document_requests_font_families(&doc));
     }
 }

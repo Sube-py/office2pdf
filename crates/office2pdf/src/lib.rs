@@ -91,6 +91,20 @@ fn is_ole2(data: &[u8]) -> bool {
     data.len() >= OLE2_MAGIC.len() && data[..OLE2_MAGIC.len()] == OLE2_MAGIC
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn should_resolve_font_context(doc: &ir::Document, options: &ConvertOptions) -> bool {
+    !options.font_paths.is_empty() || render::font_subst::document_requests_font_families(doc)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_font_context_if_needed(
+    doc: &ir::Document,
+    options: &ConvertOptions,
+) -> Option<render::font_context::FontSearchContext> {
+    should_resolve_font_context(doc, options)
+        .then(|| render::font_context::resolve_font_search_context(&options.font_paths))
+}
+
 /// Convert a file at the given path to PDF bytes with warnings.
 ///
 /// Detects the format from the file extension (`.docx`, `.pptx`, `.xlsx`).
@@ -192,18 +206,20 @@ pub fn convert_bytes(
     let page_count = doc.pages.len() as u32;
 
     #[cfg(not(target_arch = "wasm32"))]
-    let font_context = render::font_context::resolve_font_search_context(&options.font_paths);
+    let font_context = resolve_font_context_if_needed(&doc, options);
 
     #[cfg(not(target_arch = "wasm32"))]
-    warnings.extend(
-        render::font_subst::detect_missing_font_fallbacks_with_context(&doc, &font_context)
-            .into_iter()
-            .map(|(from, to)| ConvertWarning::FallbackUsed {
-                format: format_label(format).to_string(),
-                from,
-                to,
-            }),
-    );
+    if let Some(font_context) = font_context.as_ref() {
+        warnings.extend(
+            render::font_subst::detect_missing_font_fallbacks_with_context(&doc, font_context)
+                .into_iter()
+                .map(|(from, to)| ConvertWarning::FallbackUsed {
+                    format: format_label(format).to_string(),
+                    from,
+                    to,
+                }),
+        );
+    }
 
     #[cfg(target_arch = "wasm32")]
     warnings.extend(
@@ -223,7 +239,7 @@ pub fn convert_bytes(
     let output = render::typst_gen::generate_typst_with_options_and_font_context(
         &doc,
         options,
-        Some(&font_context),
+        font_context.as_ref(),
     )?;
     #[cfg(target_arch = "wasm32")]
     let output = render::typst_gen::generate_typst_with_options(&doc, options)?;
@@ -236,7 +252,10 @@ pub fn convert_bytes(
         &output.source,
         &output.images,
         options.pdf_standard,
-        font_context.search_paths(),
+        font_context
+            .as_ref()
+            .map(|context| context.search_paths())
+            .unwrap_or(&[]),
         options.tagged,
         options.pdf_ua,
     )?;
@@ -310,12 +329,12 @@ fn convert_bytes_streaming_xlsx(
             styles: ir::StyleSheet::default(),
         };
         #[cfg(not(target_arch = "wasm32"))]
-        let font_context = render::font_context::resolve_font_search_context(&options.font_paths);
+        let font_context = resolve_font_context_if_needed(&empty_doc, options);
         #[cfg(not(target_arch = "wasm32"))]
         let output = render::typst_gen::generate_typst_with_options_and_font_context(
             &empty_doc,
             &ConvertOptions::default(),
-            Some(&font_context),
+            font_context.as_ref(),
         )?;
         #[cfg(target_arch = "wasm32")]
         let output = render::typst_gen::generate_typst(&empty_doc)?;
@@ -324,7 +343,10 @@ fn convert_bytes_streaming_xlsx(
             &output.source,
             &output.images,
             None,
-            font_context.search_paths(),
+            font_context
+                .as_ref()
+                .map(|context| context.search_paths())
+                .unwrap_or(&[]),
             false,
             false,
         )?;
@@ -355,7 +377,17 @@ fn convert_bytes_streaming_xlsx(
     let mut total_page_count = 0u32;
 
     #[cfg(not(target_arch = "wasm32"))]
-    let font_context = render::font_context::resolve_font_search_context(&options.font_paths);
+    let font_context = if options.font_paths.is_empty()
+        && !chunk_docs
+            .iter()
+            .any(render::font_subst::document_requests_font_families)
+    {
+        None
+    } else {
+        Some(render::font_context::resolve_font_search_context(
+            &options.font_paths,
+        ))
+    };
 
     for chunk_doc in chunk_docs {
         total_page_count += chunk_doc.pages.len() as u32;
@@ -365,7 +397,7 @@ fn convert_bytes_streaming_xlsx(
         let output = render::typst_gen::generate_typst_with_options_and_font_context(
             &chunk_doc,
             options,
-            Some(&font_context),
+            font_context.as_ref(),
         )?;
         #[cfg(target_arch = "wasm32")]
         let output = render::typst_gen::generate_typst_with_options(&chunk_doc, options)?;
@@ -377,7 +409,10 @@ fn convert_bytes_streaming_xlsx(
             &output.source,
             &output.images,
             options.pdf_standard,
-            font_context.search_paths(),
+            font_context
+                .as_ref()
+                .map(|context| context.search_paths())
+                .unwrap_or(&[]),
             options.tagged,
             options.pdf_ua,
         )?;
@@ -436,17 +471,21 @@ fn convert_bytes_streaming_xlsx(
 pub fn render_document(doc: &ir::Document) -> Result<Vec<u8>, ConvertError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let font_context = render::font_context::resolve_font_search_context(&[]);
+        let options = ConvertOptions::default();
+        let font_context = resolve_font_context_if_needed(doc, &options);
         let output = render::typst_gen::generate_typst_with_options_and_font_context(
             doc,
-            &ConvertOptions::default(),
-            Some(&font_context),
+            &options,
+            font_context.as_ref(),
         )?;
         render::pdf::compile_to_pdf(
             &output.source,
             &output.images,
             None,
-            font_context.search_paths(),
+            font_context
+                .as_ref()
+                .map(|context| context.search_paths())
+                .unwrap_or(&[]),
             false,
             false,
         )
@@ -776,6 +815,62 @@ mod tests {
         let pdf = render_document(&doc).unwrap();
         assert!(!pdf.is_empty());
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_should_resolve_font_context_false_for_default_document_without_user_paths() {
+        let doc = make_simple_document("Plain text");
+
+        assert!(!should_resolve_font_context(
+            &doc,
+            &ConvertOptions::default()
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_should_resolve_font_context_true_when_user_font_paths_are_provided() {
+        let doc = make_simple_document("Plain text");
+        let options = ConvertOptions {
+            font_paths: vec![std::env::temp_dir()],
+            ..ConvertOptions::default()
+        };
+
+        assert!(should_resolve_font_context(&doc, &options));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_should_resolve_font_context_true_when_document_requests_font_family() {
+        let doc = Document {
+            metadata: Metadata::default(),
+            pages: vec![Page::Flow(FlowPage {
+                size: PageSize::default(),
+                margins: Margins::default(),
+                content: vec![Block::Paragraph(Paragraph {
+                    style: ParagraphStyle::default(),
+                    runs: vec![Run {
+                        text: "Styled text".to_string(),
+                        style: TextStyle {
+                            font_family: Some("Pretendard".to_string()),
+                            ..TextStyle::default()
+                        },
+                        href: None,
+                        footnote: None,
+                    }],
+                })],
+                header: None,
+                footer: None,
+                columns: None,
+            })],
+            styles: StyleSheet::default(),
+        };
+
+        assert!(should_resolve_font_context(
+            &doc,
+            &ConvertOptions::default()
+        ));
     }
 
     #[test]
