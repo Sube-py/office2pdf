@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::style::{Color, ParagraphStyle, TextStyle};
+use super::style::{Alignment, Color, ParagraphStyle, TextStyle};
 
 /// Header or footer content for flow pages.
 #[derive(Debug, Clone)]
@@ -33,6 +33,7 @@ pub enum Block {
     Table(Table),
     Image(ImageData),
     FloatingImage(FloatingImage),
+    FloatingTextBox(FloatingTextBox),
     List(List),
     MathEquation(MathEquation),
     Chart(Chart),
@@ -111,6 +112,19 @@ pub struct FloatingImage {
     pub offset_y: f64,
 }
 
+/// A floating text box with positioning, size, and text wrap mode.
+#[derive(Debug, Clone)]
+pub struct FloatingTextBox {
+    pub content: Vec<Block>,
+    pub wrap_mode: WrapMode,
+    pub width: f64,
+    pub height: f64,
+    /// Horizontal offset in points from the anchor reference.
+    pub offset_x: f64,
+    /// Vertical offset in points from the anchor reference.
+    pub offset_y: f64,
+}
+
 /// The kind of list: ordered (numbered) or unordered (bulleted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListKind {
@@ -166,10 +180,16 @@ pub struct Run {
 }
 
 /// A table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Table {
     pub rows: Vec<TableRow>,
     pub column_widths: Vec<f64>,
+    /// Number of leading rows that should repeat as the table header.
+    pub header_row_count: usize,
+    /// Optional block alignment for the table within the flow.
+    pub alignment: Option<Alignment>,
+    /// Default cell padding applied by the table when cells don't override it.
+    pub default_cell_padding: Option<Insets>,
 }
 
 /// A table row.
@@ -196,6 +216,15 @@ pub enum CellVerticalAlign {
     Bottom,
 }
 
+/// Insets/padding in points.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Insets {
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
+}
+
 /// A table cell.
 #[derive(Debug, Clone)]
 pub struct TableCell {
@@ -210,6 +239,8 @@ pub struct TableCell {
     pub icon_text: Option<String>,
     /// Vertical alignment of cell content.
     pub vertical_align: Option<CellVerticalAlign>,
+    /// Optional cell padding override in points.
+    pub padding: Option<Insets>,
 }
 
 impl Default for TableCell {
@@ -223,6 +254,7 @@ impl Default for TableCell {
             data_bar: None,
             icon_text: None,
             vertical_align: None,
+            padding: None,
         }
     }
 }
