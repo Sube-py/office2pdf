@@ -1,4 +1,7 @@
 use std::fmt::Write;
+use std::io::Cursor;
+
+use image::{GenericImageView, ImageFormat as RasterImageFormat};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::config::ConvertOptions;
@@ -6,12 +9,14 @@ use crate::error::ConvertError;
 use crate::ir::{
     Alignment, Block, BorderLineStyle, BorderSide, CellBorder, CellVerticalAlign, Chart, ChartType,
     Color, ColumnLayout, Document, FixedElement, FixedElementKind, FixedPage, FloatingImage,
-    FloatingTextBox, FlowPage, GradientFill, HFInline, HeaderFooter, ImageData, ImageFormat,
-    Insets, LineSpacing, List, ListKind, Margins, MathEquation, Metadata, Page, PageSize,
-    Paragraph, ParagraphStyle, Run, Shadow, Shape, ShapeKind, SmartArt, TabAlignment, TabLeader,
-    TabStop, Table, TableCell, TablePage, TableRow, TextDirection, TextStyle, VerticalTextAlign,
-    WrapMode,
+    FloatingTextBox, FlowPage, GradientFill, HFInline, HeaderFooter, ImageCrop, ImageData,
+    ImageFormat, Insets, LineSpacing, List, ListKind, Margins, MathEquation, Metadata, Page,
+    PageSize, Paragraph, ParagraphStyle, Run, Shadow, Shape, ShapeKind, SmartArt, TabAlignment,
+    TabLeader, TabStop, Table, TableCell, TablePage, TableRow, TextDirection, TextStyle,
+    VerticalTextAlign, WrapMode,
 };
+
+use super::font_context::FontSearchContext;
 
 /// An image asset to be embedded in the Typst compilation.
 #[derive(Debug, Clone)]
@@ -50,16 +55,66 @@ impl GenCtx {
         }
     }
 
-    fn add_image(&mut self, data: &[u8], format: ImageFormat) -> String {
+    fn add_image(&mut self, image: &ImageData) -> String {
+        let (data, format) = preprocess_image_asset(image);
         let ext = format.extension();
         let id = self.next_image_id;
         self.next_image_id += 1;
         let path = format!("img-{id}.{ext}");
         self.images.push(ImageAsset {
             path: path.clone(),
-            data: data.to_vec(),
+            data,
         });
         path
+    }
+}
+
+fn raster_image_format(format: ImageFormat) -> Option<RasterImageFormat> {
+    match format {
+        ImageFormat::Png => Some(RasterImageFormat::Png),
+        ImageFormat::Jpeg => Some(RasterImageFormat::Jpeg),
+        ImageFormat::Gif => Some(RasterImageFormat::Gif),
+        ImageFormat::Bmp => Some(RasterImageFormat::Bmp),
+        ImageFormat::Tiff => Some(RasterImageFormat::Tiff),
+        ImageFormat::Svg => None,
+    }
+}
+
+fn crop_to_pixels(crop: ImageCrop, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    let left = ((crop.left.clamp(0.0, 1.0) * width as f64).round() as u32).min(width);
+    let top = ((crop.top.clamp(0.0, 1.0) * height as f64).round() as u32).min(height);
+    let right = ((crop.right.clamp(0.0, 1.0) * width as f64).round() as u32).min(width);
+    let bottom = ((crop.bottom.clamp(0.0, 1.0) * height as f64).round() as u32).min(height);
+    if left + right >= width || top + bottom >= height {
+        return None;
+    }
+    Some((left, top, width - left - right, height - top - bottom))
+}
+
+fn preprocess_image_asset(image: &ImageData) -> (Vec<u8>, ImageFormat) {
+    let Some(crop) = image.crop.filter(|crop| !crop.is_empty()) else {
+        return (image.data.clone(), image.format);
+    };
+    let Some(raster_format) = raster_image_format(image.format) else {
+        return (image.data.clone(), image.format);
+    };
+    let Ok(decoded) = image::load_from_memory_with_format(&image.data, raster_format) else {
+        return (image.data.clone(), image.format);
+    };
+    let (width, height) = decoded.dimensions();
+    let Some((left, top, crop_width, crop_height)) = crop_to_pixels(crop, width, height) else {
+        return (image.data.clone(), image.format);
+    };
+
+    let cropped = decoded.crop_imm(left, top, crop_width, crop_height);
+    let mut encoded = Cursor::new(Vec::new());
+    if cropped
+        .write_to(&mut encoded, RasterImageFormat::Png)
+        .is_ok()
+    {
+        (encoded.into_inner(), ImageFormat::Png)
+    } else {
+        (image.data.clone(), image.format)
     }
 }
 
@@ -160,7 +215,7 @@ fn escape_typst_string(s: &str) -> String {
 
 /// Generate Typst markup from a Document IR.
 pub fn generate_typst(doc: &Document) -> Result<TypstOutput, ConvertError> {
-    generate_typst_with_options(doc, &ConvertOptions::default())
+    generate_typst_with_options_and_font_context(doc, &ConvertOptions::default(), None)
 }
 
 /// Generate Typst markup from a Document IR with conversion options.
@@ -171,28 +226,38 @@ pub fn generate_typst_with_options(
     doc: &Document,
     options: &ConvertOptions,
 ) -> Result<TypstOutput, ConvertError> {
-    // Pre-allocate output string: ~2KB per page is a reasonable estimate
-    let mut out = String::with_capacity(doc.pages.len() * 2048);
+    generate_typst_with_options_and_font_context(doc, options, None)
+}
 
-    // Emit document metadata (title/author) if present
-    generate_document_metadata(&mut out, &doc.metadata);
+pub(crate) fn generate_typst_with_options_and_font_context(
+    doc: &Document,
+    options: &ConvertOptions,
+    font_context: Option<&FontSearchContext>,
+) -> Result<TypstOutput, ConvertError> {
+    super::font_subst::with_font_search_context(font_context, || {
+        // Pre-allocate output string: ~2KB per page is a reasonable estimate
+        let mut out = String::with_capacity(doc.pages.len() * 2048);
 
-    let mut ctx = GenCtx::new();
-    for (index, page) in doc.pages.iter().enumerate() {
-        if index > 0 {
-            out.push_str("\n#pagebreak()\n");
-        }
-        match page {
-            Page::Flow(flow) => generate_flow_page(&mut out, flow, &mut ctx, options)?,
-            Page::Fixed(fixed) => generate_fixed_page(&mut out, fixed, &mut ctx, options)?,
-            Page::Table(table_page) => {
-                generate_table_page(&mut out, table_page, &mut ctx, options)?;
+        // Emit document metadata (title/author) if present
+        generate_document_metadata(&mut out, &doc.metadata);
+
+        let mut ctx = GenCtx::new();
+        for (index, page) in doc.pages.iter().enumerate() {
+            if index > 0 {
+                out.push_str("\n#pagebreak()\n");
+            }
+            match page {
+                Page::Flow(flow) => generate_flow_page(&mut out, flow, &mut ctx, options)?,
+                Page::Fixed(fixed) => generate_fixed_page(&mut out, fixed, &mut ctx, options)?,
+                Page::Table(table_page) => {
+                    generate_table_page(&mut out, table_page, &mut ctx, options)?;
+                }
             }
         }
-    }
-    Ok(TypstOutput {
-        source: out,
-        images: ctx.images,
+        Ok(TypstOutput {
+            source: out,
+            images: ctx.images,
+        })
     })
 }
 
@@ -1689,7 +1754,7 @@ fn generate_cell_paragraph(out: &mut String, para: &Paragraph) {
 }
 
 fn generate_image(out: &mut String, img: &ImageData, ctx: &mut GenCtx) {
-    let path = ctx.add_image(&img.data, img.format);
+    let path = ctx.add_image(img);
     out.push_str("#image(\"");
     out.push_str(&path);
     out.push('"');
@@ -1711,7 +1776,7 @@ fn generate_image(out: &mut String, img: &ImageData, ctx: &mut GenCtx) {
 /// - Behind/InFront/None: `#place()` with no text wrapping
 /// - Square/Tight/TopAndBottom: `#place()` with `float: true` for best-effort text flow
 fn generate_floating_image(out: &mut String, fi: &FloatingImage, ctx: &mut GenCtx) {
-    let path = ctx.add_image(&fi.image.data, fi.image.format);
+    let path = ctx.add_image(&fi.image);
 
     match fi.wrap_mode {
         WrapMode::TopAndBottom => {
@@ -2363,6 +2428,50 @@ fn has_text_properties(style: &TextStyle) -> bool {
         || style.letter_spacing.is_some()
 }
 
+fn inferred_font_weight(font_family: &str) -> Option<&'static str> {
+    let lower = font_family.trim().to_ascii_lowercase();
+    if lower.contains("extrabold") || lower.contains("extra bold") {
+        Some("extrabold")
+    } else if lower.contains("semibold") || lower.contains("semi bold") {
+        Some("semibold")
+    } else if lower.contains("medium") {
+        Some("medium")
+    } else if lower.contains("light") {
+        Some("light")
+    } else {
+        None
+    }
+}
+
+fn font_weight_rank(weight: &str) -> u8 {
+    match weight {
+        "light" => 1,
+        "medium" => 2,
+        "semibold" => 3,
+        "bold" => 4,
+        "extrabold" => 5,
+        "black" => 6,
+        _ => 0,
+    }
+}
+
+fn effective_font_weight(style: &TextStyle) -> Option<&'static str> {
+    let inferred = style.font_family.as_deref().and_then(inferred_font_weight);
+    let explicit = matches!(style.bold, Some(true)).then_some("bold");
+    match (explicit, inferred) {
+        (Some(explicit), Some(inferred)) => {
+            if font_weight_rank(explicit) >= font_weight_rank(inferred) {
+                Some(explicit)
+            } else {
+                Some(inferred)
+            }
+        }
+        (Some(explicit), None) => Some(explicit),
+        (None, Some(inferred)) => Some(inferred),
+        (None, None) => None,
+    }
+}
+
 fn write_text_params(out: &mut String, style: &TextStyle) {
     let mut first = true;
 
@@ -2373,8 +2482,8 @@ fn write_text_params(out: &mut String, style: &TextStyle) {
     if let Some(size) = style.font_size {
         write_param(out, &mut first, &format!("size: {}pt", format_f64(size)));
     }
-    if matches!(style.bold, Some(true)) {
-        write_param(out, &mut first, "weight: \"bold\"");
+    if let Some(weight) = effective_font_weight(style) {
+        write_param(out, &mut first, &format!("weight: \"{weight}\""));
     }
     if matches!(style.italic, Some(true)) {
         write_param(out, &mut first, "style: \"italic\"");
@@ -3882,7 +3991,7 @@ mod tests {
 
     // ── Image codegen tests ─────────────────────────────────────────────
 
-    use crate::ir::ImageData;
+    use crate::ir::{ImageCrop, ImageData};
 
     /// Minimal valid 1x1 red pixel PNG for testing.
     const MINIMAL_PNG: &[u8] = &[
@@ -3893,12 +4002,27 @@ mod tests {
         0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
+    fn make_quadrant_png() -> Vec<u8> {
+        let mut image = image::RgbaImage::new(2, 2);
+        image.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        image.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+        image.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
+        image.put_pixel(1, 1, image::Rgba([255, 255, 0, 255]));
+
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, RasterImageFormat::Png)
+            .unwrap();
+        encoded.into_inner()
+    }
+
     fn make_image(format: ImageFormat, width: Option<f64>, height: Option<f64>) -> Block {
         Block::Image(ImageData {
             data: MINIMAL_PNG.to_vec(),
             format,
             width,
             height,
+            crop: None,
         })
     }
 
@@ -3915,6 +4039,38 @@ mod tests {
             "Expected #image(\"img-0.png\") in: {}",
             output.source
         );
+    }
+
+    #[test]
+    fn test_image_crop_preprocesses_raster_asset() {
+        let doc = make_doc(vec![make_flow_page(vec![Block::Image(ImageData {
+            data: make_quadrant_png(),
+            format: ImageFormat::Png,
+            width: Some(20.0),
+            height: Some(20.0),
+            crop: Some(ImageCrop {
+                left: 0.5,
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+            }),
+        })])]);
+        let output = generate_typst(&doc).unwrap();
+        assert!(
+            output
+                .source
+                .contains("#image(\"img-0.png\", width: 20pt, height: 20pt)"),
+            "Expected original display size in: {}",
+            output.source
+        );
+
+        let cropped =
+            image::load_from_memory_with_format(&output.images[0].data, RasterImageFormat::Png)
+                .unwrap()
+                .to_rgba8();
+        assert_eq!(cropped.dimensions(), (1, 2));
+        assert_eq!(cropped.get_pixel(0, 0).0, [0, 255, 0, 255]);
+        assert_eq!(cropped.get_pixel(0, 1).0, [255, 255, 0, 255]);
     }
 
     #[test]
@@ -4003,6 +4159,7 @@ mod tests {
             (ImageFormat::Gif, "gif"),
             (ImageFormat::Bmp, "bmp"),
             (ImageFormat::Tiff, "tiff"),
+            (ImageFormat::Svg, "svg"),
         ];
         for (i, (format, expected_ext)) in formats.iter().enumerate() {
             let doc = make_doc(vec![make_flow_page(vec![make_image(*format, None, None)])]);
@@ -4126,6 +4283,7 @@ mod tests {
                 format,
                 width: Some(w),
                 height: Some(h),
+                crop: None,
             }),
         }
     }
@@ -5950,6 +6108,7 @@ mod tests {
                         format: ImageFormat::Png,
                         width: Some(200.0),
                         height: Some(100.0),
+                        crop: None,
                     },
                     wrap_mode: WrapMode::Square,
                     offset_x: 72.0,
@@ -5994,6 +6153,7 @@ mod tests {
                         format: ImageFormat::Png,
                         width: Some(150.0),
                         height: Some(75.0),
+                        crop: None,
                     },
                     wrap_mode: WrapMode::TopAndBottom,
                     offset_x: 10.0,
@@ -6033,6 +6193,7 @@ mod tests {
                         format: ImageFormat::Png,
                         width: Some(100.0),
                         height: Some(50.0),
+                        crop: None,
                     },
                     wrap_mode: WrapMode::Behind,
                     offset_x: 0.0,
@@ -7382,6 +7543,85 @@ mod tests {
         assert!(
             result.contains(r#"font: ("Times New Roman", "Liberation Serif", "Tinos")"#),
             "Expected font fallback list for Times New Roman in: {result}"
+        );
+    }
+
+    #[test]
+    fn test_font_family_infers_medium_weight_from_family_name() {
+        let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+            style: ParagraphStyle::default(),
+            runs: vec![Run {
+                text: "Title".to_string(),
+                style: TextStyle {
+                    font_family: Some("Pretendard Medium".to_string()),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+            }],
+        })])]);
+        let result = generate_typst(&doc).unwrap().source;
+        assert!(
+            result.contains(r#"weight: "medium""#),
+            "Expected medium weight inferred from family name in: {result}"
+        );
+    }
+
+    #[test]
+    fn test_font_family_infers_extrabold_weight_from_family_name() {
+        let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+            style: ParagraphStyle::default(),
+            runs: vec![Run {
+                text: "Heading".to_string(),
+                style: TextStyle {
+                    font_family: Some("Pretendard ExtraBold".to_string()),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+            }],
+        })])]);
+        let result = generate_typst(&doc).unwrap().source;
+        assert!(
+            result.contains(r#"weight: "extrabold""#),
+            "Expected extrabold weight inferred from family name in: {result}"
+        );
+    }
+
+    #[test]
+    fn test_generate_typst_prefers_office_font_fallback_order_when_context_present() {
+        let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+            style: ParagraphStyle::default(),
+            runs: vec![Run {
+                text: "Title".to_string(),
+                style: TextStyle {
+                    font_family: Some("Pretendard".to_string()),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+            }],
+        })])]);
+        let context = FontSearchContext::for_test(
+            Vec::new(),
+            &["Apple SD Gothic Neo", "Malgun Gothic"],
+            &["Malgun Gothic"],
+            &[],
+        );
+
+        let output = generate_typst_with_options_and_font_context(
+            &doc,
+            &ConvertOptions::default(),
+            Some(&context),
+        )
+        .unwrap();
+
+        assert!(
+            output
+                .source
+                .contains(r#"font: ("Pretendard", "Malgun Gothic", "Apple SD Gothic Neo""#),
+            "Office-managed font should be emitted ahead of system fallback: {}",
+            output.source
         );
     }
 

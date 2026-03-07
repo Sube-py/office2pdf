@@ -15,6 +15,7 @@ No LibreOffice, no Chromium, no Docker — just a single binary powered by [Typs
 - **PPTX** — slides, text boxes, shapes, images, slide masters, speaker notes, gradient backgrounds, shadow/reflection effects
 - **XLSX** — sheets, cell formatting, merged cells, column widths, row heights, conditional formatting (DataBar, IconSet)
 - **PDF/A-2b** — archival-compliant output via `--pdf-a`
+- **macOS Office font auto-discovery** — PowerPoint/Word/Excel bundled fonts and Office cloud font caches are searched automatically
 - **WASM** — runs in browsers and Node.js via WebAssembly (optional `wasm` feature)
 - **Zero external dependencies** — runs as a standalone executable
 
@@ -83,6 +84,8 @@ office2pdf document.docx --pdf-a
 office2pdf report.docx --font-path /usr/share/fonts/custom
 ```
 
+On macOS, `office2pdf` automatically searches Microsoft Office app fonts and local Office font caches before falling back to regular system fonts. `--font-path` is only needed as an override for custom local fonts.
+
 ### WASM (Browser / Node.js)
 
 Build with `wasm-pack`:
@@ -118,7 +121,7 @@ Available functions: `convertToPdf(data, format)`, `convertDocxToPdf(data)`, `co
 | `--pdf-a` | Produce PDF/A-2b compliant output |
 | `--sheets <NAMES>` | XLSX sheet filter (comma-separated) |
 | `--slides <RANGE>` | PPTX slide range (e.g. `1-5` or `3`) |
-| `--font-path <DIR>` | Additional font directory (repeatable) |
+| `--font-path <DIR>` | Additional font directory override (repeatable) |
 
 ## Supported Formats
 

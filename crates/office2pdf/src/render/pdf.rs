@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use typst::diag::FileResult;
@@ -30,6 +30,11 @@ struct CachedFontData {
 #[cfg(not(target_arch = "wasm32"))]
 static SYSTEM_FONTS: OnceLock<CachedFontData> = OnceLock::new();
 
+/// Cached font data for resolved extra font path sets.
+#[cfg(not(target_arch = "wasm32"))]
+static EXTRA_FONT_PATHS_CACHE: OnceLock<Mutex<HashMap<Vec<PathBuf>, Arc<CachedFontData>>>> =
+    OnceLock::new();
+
 /// Cached embedded-only fonts (no system font search). Used on WASM
 /// or when system fonts are not needed.
 static EMBEDDED_FONTS: OnceLock<CachedFontData> = OnceLock::new();
@@ -46,6 +51,36 @@ fn get_system_fonts() -> &'static CachedFontData {
             fonts: font_data.fonts,
         }
     })
+}
+
+/// Get or initialize cached fonts for a resolved extra font path set.
+#[cfg(not(target_arch = "wasm32"))]
+fn get_fonts_for_extra_paths(font_paths: &[PathBuf]) -> Arc<CachedFontData> {
+    let cache = EXTRA_FONT_PATHS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let cache_guard = cache
+            .lock()
+            .expect("font cache mutex should not be poisoned");
+        if let Some(cached) = cache_guard.get(font_paths) {
+            return Arc::clone(cached);
+        }
+    }
+
+    let mut searcher = FontSearcher::new();
+    searcher.include_system_fonts(true);
+    let font_data = searcher.search_with(font_paths.iter().map(|path| path.as_path()));
+    let cached = Arc::new(CachedFontData {
+        book: LazyHash::new(font_data.book),
+        fonts: font_data.fonts,
+    });
+
+    let mut cache_guard = cache
+        .lock()
+        .expect("font cache mutex should not be poisoned");
+    let entry = cache_guard
+        .entry(font_paths.to_vec())
+        .or_insert_with(|| Arc::clone(&cached));
+    Arc::clone(entry)
 }
 
 /// Get or initialize cached embedded-only fonts.
@@ -204,22 +239,22 @@ fn current_utc_datetime() -> Datetime {
 enum FontSource {
     /// Reference to globally cached font data (common case).
     Cached(&'static CachedFontData),
-    /// Owned font data for custom font path searches.
-    Owned(Box<CachedFontData>),
+    /// Shared cached font data for resolved extra font paths.
+    Shared(Arc<CachedFontData>),
 }
 
 impl FontSource {
     fn book(&self) -> &LazyHash<typst::text::FontBook> {
         match self {
             Self::Cached(d) => &d.book,
-            Self::Owned(d) => &d.book,
+            Self::Shared(d) => &d.book,
         }
     }
 
     fn fonts(&self) -> &[typst_kit::fonts::FontSlot] {
         match self {
             Self::Cached(d) => &d.fonts,
-            Self::Owned(d) => &d.fonts,
+            Self::Shared(d) => &d.fonts,
         }
     }
 }
@@ -237,19 +272,13 @@ impl MinimalWorld {
     ///
     /// When `font_paths` is empty (the common case), system fonts are loaded from
     /// a process-wide cache, avoiding expensive filesystem scanning on repeated calls.
-    /// When custom font paths are provided, a fresh font search is performed.
+    /// Resolved extra font path sets are also cached by path list.
     #[cfg(not(target_arch = "wasm32"))]
     fn new(source_text: &str, images: &[ImageAsset], font_paths: &[PathBuf]) -> Self {
         let font_source = if font_paths.is_empty() {
             FontSource::Cached(get_system_fonts())
         } else {
-            let mut searcher = FontSearcher::new();
-            searcher.include_system_fonts(true);
-            let font_data = searcher.search_with(font_paths.iter().map(|p| p.as_path()));
-            FontSource::Owned(Box::new(CachedFontData {
-                book: LazyHash::new(font_data.book),
-                fonts: font_data.fonts,
-            }))
+            FontSource::Shared(get_fonts_for_extra_paths(font_paths))
         };
 
         let main_id = FileId::new(None, VirtualPath::new("main.typ"));
@@ -485,6 +514,10 @@ Hello from a US Letter page."#;
         png
     }
 
+    fn make_test_svg() -> Vec<u8> {
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1" viewBox="0 0 1 1"><rect width="1" height="1" fill="#ff0000"/></svg>"##.to_vec()
+    }
+
     #[test]
     fn test_embedded_fonts_are_available() {
         // MinimalWorld should always have embedded fallback fonts available
@@ -610,6 +643,19 @@ Text in Libertinus Serif."#;
             data: png_data,
         }];
         let source = r#"#image("img-0.png", width: 100pt)"#;
+        let result = compile_to_pdf(source, &images, None, &[], false, false).unwrap();
+        assert!(!result.is_empty());
+        assert!(result.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn test_compile_with_embedded_svg_image() {
+        let svg_data = make_test_svg();
+        let images = vec![ImageAsset {
+            path: "img-0.svg".to_string(),
+            data: svg_data,
+        }];
+        let source = r#"#image("img-0.svg", width: 100pt)"#;
         let result = compile_to_pdf(source, &images, None, &[], false, false).unwrap();
         assert!(!result.is_empty());
         assert!(result.starts_with(b"%PDF"));

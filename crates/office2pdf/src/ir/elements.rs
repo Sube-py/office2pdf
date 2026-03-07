@@ -289,6 +289,21 @@ pub struct BorderSide {
     pub style: BorderLineStyle,
 }
 
+/// Fractions of the source image cropped away from each edge.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ImageCrop {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+
+impl ImageCrop {
+    pub fn is_empty(&self) -> bool {
+        self.left == 0.0 && self.top == 0.0 && self.right == 0.0 && self.bottom == 0.0
+    }
+}
+
 /// Image data.
 #[derive(Debug, Clone)]
 pub struct ImageData {
@@ -296,6 +311,7 @@ pub struct ImageData {
     pub format: ImageFormat,
     pub width: Option<f64>,
     pub height: Option<f64>,
+    pub crop: Option<ImageCrop>,
 }
 
 /// Supported image formats.
@@ -306,6 +322,7 @@ pub enum ImageFormat {
     Gif,
     Bmp,
     Tiff,
+    Svg,
 }
 
 impl ImageFormat {
@@ -317,6 +334,7 @@ impl ImageFormat {
             Self::Gif => "gif",
             Self::Bmp => "bmp",
             Self::Tiff => "tiff",
+            Self::Svg => "svg",
         }
     }
 }

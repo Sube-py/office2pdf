@@ -2871,6 +2871,7 @@ fn extract_drawing_image(
         format: ImageFormat::Png, // docx-rs converts all images to PNG
         width,
         height,
+        crop: None,
     };
 
     // Check if this is an anchor (floating) image

@@ -37,6 +37,7 @@
 //! std::fs::write("report.pdf", &result.pdf).unwrap();
 //! ```
 
+use std::collections::HashSet;
 pub mod config;
 pub mod error;
 pub mod ir;
@@ -50,8 +51,21 @@ pub mod wasm;
 use std::time::Instant;
 
 use config::{ConvertOptions, Format};
-use error::{ConvertError, ConvertMetrics, ConvertResult};
+use error::{ConvertError, ConvertMetrics, ConvertResult, ConvertWarning};
 use parser::Parser;
+
+fn format_label(format: Format) -> &'static str {
+    match format {
+        Format::Docx => "DOCX",
+        Format::Pptx => "PPTX",
+        Format::Xlsx => "XLSX",
+    }
+}
+
+fn dedup_warnings(warnings: &mut Vec<ConvertWarning>) {
+    let mut seen = HashSet::new();
+    warnings.retain(|warning| seen.insert(warning.to_string()));
+}
 
 /// Extract a human-readable message from a caught panic payload.
 fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -165,7 +179,7 @@ pub fn convert_bytes(
     let parse_start = Instant::now();
     let parse_result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse(data, options)));
-    let (doc, warnings) = match parse_result {
+    let (doc, mut warnings) = match parse_result {
         Ok(result) => result?,
         Err(panic_info) => {
             return Err(ConvertError::Parse(format!(
@@ -177,13 +191,56 @@ pub fn convert_bytes(
     let parse_duration = parse_start.elapsed();
     let page_count = doc.pages.len() as u32;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    let font_context = render::font_context::resolve_font_search_context(&options.font_paths);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    warnings.extend(
+        render::font_subst::detect_missing_font_fallbacks_with_context(&doc, &font_context)
+            .into_iter()
+            .map(|(from, to)| ConvertWarning::FallbackUsed {
+                format: format_label(format).to_string(),
+                from,
+                to,
+            }),
+    );
+
+    #[cfg(target_arch = "wasm32")]
+    warnings.extend(
+        render::font_subst::detect_missing_font_fallbacks(&doc, &options.font_paths)
+            .into_iter()
+            .map(|(from, to)| ConvertWarning::FallbackUsed {
+                format: format_label(format).to_string(),
+                from,
+                to,
+            }),
+    );
+    dedup_warnings(&mut warnings);
+
     // Stage 2: Codegen (IR → Typst)
     let codegen_start = Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let output = render::typst_gen::generate_typst_with_options_and_font_context(
+        &doc,
+        options,
+        Some(&font_context),
+    )?;
+    #[cfg(target_arch = "wasm32")]
     let output = render::typst_gen::generate_typst_with_options(&doc, options)?;
     let codegen_duration = codegen_start.elapsed();
 
     // Stage 3: Compile (Typst → PDF)
     let compile_start = Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let pdf = render::pdf::compile_to_pdf(
+        &output.source,
+        &output.images,
+        options.pdf_standard,
+        font_context.search_paths(),
+        options.tagged,
+        options.pdf_ua,
+    )?;
+    #[cfg(target_arch = "wasm32")]
     let pdf = render::pdf::compile_to_pdf(
         &output.source,
         &output.images,
@@ -234,7 +291,7 @@ fn convert_bytes_streaming_xlsx(
     let parse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         xlsx_parser.parse_streaming(data, options, chunk_size)
     }));
-    let (chunk_docs, warnings) = match parse_result {
+    let (chunk_docs, mut warnings) = match parse_result {
         Ok(result) => result?,
         Err(panic_info) => {
             return Err(ConvertError::Parse(format!(
@@ -252,10 +309,30 @@ fn convert_bytes_streaming_xlsx(
             pages: vec![],
             styles: ir::StyleSheet::default(),
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let font_context = render::font_context::resolve_font_search_context(&options.font_paths);
+        #[cfg(not(target_arch = "wasm32"))]
+        let output = render::typst_gen::generate_typst_with_options_and_font_context(
+            &empty_doc,
+            &ConvertOptions::default(),
+            Some(&font_context),
+        )?;
+        #[cfg(target_arch = "wasm32")]
         let output = render::typst_gen::generate_typst(&empty_doc)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let pdf = render::pdf::compile_to_pdf(
+            &output.source,
+            &output.images,
+            None,
+            font_context.search_paths(),
+            false,
+            false,
+        )?;
+        #[cfg(target_arch = "wasm32")]
         let pdf =
             render::pdf::compile_to_pdf(&output.source, &output.images, None, &[], false, false)?;
         let total_duration = total_start.elapsed();
+        dedup_warnings(&mut warnings);
         return Ok(ConvertResult {
             pdf,
             warnings,
@@ -277,14 +354,34 @@ fn convert_bytes_streaming_xlsx(
     let mut compile_duration_total = std::time::Duration::ZERO;
     let mut total_page_count = 0u32;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    let font_context = render::font_context::resolve_font_search_context(&options.font_paths);
+
     for chunk_doc in chunk_docs {
         total_page_count += chunk_doc.pages.len() as u32;
 
         let codegen_start = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        let output = render::typst_gen::generate_typst_with_options_and_font_context(
+            &chunk_doc,
+            options,
+            Some(&font_context),
+        )?;
+        #[cfg(target_arch = "wasm32")]
         let output = render::typst_gen::generate_typst_with_options(&chunk_doc, options)?;
         codegen_duration_total += codegen_start.elapsed();
 
         let compile_start = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        let pdf = render::pdf::compile_to_pdf(
+            &output.source,
+            &output.images,
+            options.pdf_standard,
+            font_context.search_paths(),
+            options.tagged,
+            options.pdf_ua,
+        )?;
+        #[cfg(target_arch = "wasm32")]
         let pdf = render::pdf::compile_to_pdf(
             &output.source,
             &output.images,
@@ -309,6 +406,7 @@ fn convert_bytes_streaming_xlsx(
 
     let total_duration = total_start.elapsed();
     let output_size_bytes = final_pdf.len() as u64;
+    dedup_warnings(&mut warnings);
 
     Ok(ConvertResult {
         pdf: final_pdf,
@@ -336,8 +434,28 @@ fn convert_bytes_streaming_xlsx(
 ///
 /// Returns [`ConvertError::Render`] if Typst compilation or PDF export fails.
 pub fn render_document(doc: &ir::Document) -> Result<Vec<u8>, ConvertError> {
-    let output = render::typst_gen::generate_typst(doc)?;
-    render::pdf::compile_to_pdf(&output.source, &output.images, None, &[], false, false)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let font_context = render::font_context::resolve_font_search_context(&[]);
+        let output = render::typst_gen::generate_typst_with_options_and_font_context(
+            doc,
+            &ConvertOptions::default(),
+            Some(&font_context),
+        )?;
+        render::pdf::compile_to_pdf(
+            &output.source,
+            &output.images,
+            None,
+            font_context.search_paths(),
+            false,
+            false,
+        )
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let output = render::typst_gen::generate_typst(doc)?;
+        render::pdf::compile_to_pdf(&output.source, &output.images, None, &[], false, false)
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +851,7 @@ mod tests {
                     format: ImageFormat::Png,
                     width: Some(100.0),
                     height: Some(80.0),
+                    crop: None,
                 })],
                 header: None,
                 footer: None,
@@ -767,6 +886,7 @@ mod tests {
                         format: ImageFormat::Png,
                         width: Some(200.0),
                         height: None,
+                        crop: None,
                     }),
                     Block::Paragraph(Paragraph {
                         style: ParagraphStyle::default(),
@@ -1829,6 +1949,7 @@ mod tests {
                     format: ir::ImageFormat::Png,
                     width: Some(100.0),
                     height: Some(100.0),
+                    crop: None,
                 })],
                 header: None,
                 footer: None,
