@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -155,8 +156,12 @@ fn convert_single(
     let result = office2pdf::convert_with_options(input, options)
         .with_context(|| format!("converting {:?}", input))?;
 
+    let mut seen_warnings = HashSet::new();
     for warning in &result.warnings {
-        eprintln!("Warning: {warning}");
+        let rendered = warning.to_string();
+        if seen_warnings.insert(rendered.clone()) {
+            eprintln!("Warning: {rendered}");
+        }
     }
 
     if show_metrics && let Some(ref m) = result.metrics {

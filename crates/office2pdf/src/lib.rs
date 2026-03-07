@@ -37,6 +37,7 @@
 //! std::fs::write("report.pdf", &result.pdf).unwrap();
 //! ```
 
+use std::collections::HashSet;
 pub mod config;
 pub mod error;
 pub mod ir;
@@ -50,8 +51,21 @@ pub mod wasm;
 use std::time::Instant;
 
 use config::{ConvertOptions, Format};
-use error::{ConvertError, ConvertMetrics, ConvertResult};
+use error::{ConvertError, ConvertMetrics, ConvertResult, ConvertWarning};
 use parser::Parser;
+
+fn format_label(format: Format) -> &'static str {
+    match format {
+        Format::Docx => "DOCX",
+        Format::Pptx => "PPTX",
+        Format::Xlsx => "XLSX",
+    }
+}
+
+fn dedup_warnings(warnings: &mut Vec<ConvertWarning>) {
+    let mut seen = HashSet::new();
+    warnings.retain(|warning| seen.insert(warning.to_string()));
+}
 
 /// Extract a human-readable message from a caught panic payload.
 fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -75,6 +89,20 @@ const OLE2_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// Returns `true` if `data` starts with the OLE2 compound-file magic bytes.
 fn is_ole2(data: &[u8]) -> bool {
     data.len() >= OLE2_MAGIC.len() && data[..OLE2_MAGIC.len()] == OLE2_MAGIC
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn should_resolve_font_context(doc: &ir::Document, options: &ConvertOptions) -> bool {
+    !options.font_paths.is_empty() || render::font_subst::document_requests_font_families(doc)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_font_context_if_needed(
+    doc: &ir::Document,
+    options: &ConvertOptions,
+) -> Option<render::font_context::FontSearchContext> {
+    should_resolve_font_context(doc, options)
+        .then(|| render::font_context::resolve_font_search_context(&options.font_paths))
 }
 
 /// Convert a file at the given path to PDF bytes with warnings.
@@ -165,7 +193,7 @@ pub fn convert_bytes(
     let parse_start = Instant::now();
     let parse_result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse(data, options)));
-    let (doc, warnings) = match parse_result {
+    let (doc, mut warnings) = match parse_result {
         Ok(result) => result?,
         Err(panic_info) => {
             return Err(ConvertError::Parse(format!(
@@ -177,13 +205,61 @@ pub fn convert_bytes(
     let parse_duration = parse_start.elapsed();
     let page_count = doc.pages.len() as u32;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    let font_context = resolve_font_context_if_needed(&doc, options);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(font_context) = font_context.as_ref() {
+        warnings.extend(
+            render::font_subst::detect_missing_font_fallbacks_with_context(&doc, font_context)
+                .into_iter()
+                .map(|(from, to)| ConvertWarning::FallbackUsed {
+                    format: format_label(format).to_string(),
+                    from,
+                    to,
+                }),
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    warnings.extend(
+        render::font_subst::detect_missing_font_fallbacks(&doc, &options.font_paths)
+            .into_iter()
+            .map(|(from, to)| ConvertWarning::FallbackUsed {
+                format: format_label(format).to_string(),
+                from,
+                to,
+            }),
+    );
+    dedup_warnings(&mut warnings);
+
     // Stage 2: Codegen (IR → Typst)
     let codegen_start = Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let output = render::typst_gen::generate_typst_with_options_and_font_context(
+        &doc,
+        options,
+        font_context.as_ref(),
+    )?;
+    #[cfg(target_arch = "wasm32")]
     let output = render::typst_gen::generate_typst_with_options(&doc, options)?;
     let codegen_duration = codegen_start.elapsed();
 
     // Stage 3: Compile (Typst → PDF)
     let compile_start = Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let pdf = render::pdf::compile_to_pdf(
+        &output.source,
+        &output.images,
+        options.pdf_standard,
+        font_context
+            .as_ref()
+            .map(|context| context.search_paths())
+            .unwrap_or(&[]),
+        options.tagged,
+        options.pdf_ua,
+    )?;
+    #[cfg(target_arch = "wasm32")]
     let pdf = render::pdf::compile_to_pdf(
         &output.source,
         &output.images,
@@ -234,7 +310,7 @@ fn convert_bytes_streaming_xlsx(
     let parse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         xlsx_parser.parse_streaming(data, options, chunk_size)
     }));
-    let (chunk_docs, warnings) = match parse_result {
+    let (chunk_docs, mut warnings) = match parse_result {
         Ok(result) => result?,
         Err(panic_info) => {
             return Err(ConvertError::Parse(format!(
@@ -252,10 +328,33 @@ fn convert_bytes_streaming_xlsx(
             pages: vec![],
             styles: ir::StyleSheet::default(),
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let font_context = resolve_font_context_if_needed(&empty_doc, options);
+        #[cfg(not(target_arch = "wasm32"))]
+        let output = render::typst_gen::generate_typst_with_options_and_font_context(
+            &empty_doc,
+            &ConvertOptions::default(),
+            font_context.as_ref(),
+        )?;
+        #[cfg(target_arch = "wasm32")]
         let output = render::typst_gen::generate_typst(&empty_doc)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let pdf = render::pdf::compile_to_pdf(
+            &output.source,
+            &output.images,
+            None,
+            font_context
+                .as_ref()
+                .map(|context| context.search_paths())
+                .unwrap_or(&[]),
+            false,
+            false,
+        )?;
+        #[cfg(target_arch = "wasm32")]
         let pdf =
             render::pdf::compile_to_pdf(&output.source, &output.images, None, &[], false, false)?;
         let total_duration = total_start.elapsed();
+        dedup_warnings(&mut warnings);
         return Ok(ConvertResult {
             pdf,
             warnings,
@@ -277,14 +376,47 @@ fn convert_bytes_streaming_xlsx(
     let mut compile_duration_total = std::time::Duration::ZERO;
     let mut total_page_count = 0u32;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    let font_context = if options.font_paths.is_empty()
+        && !chunk_docs
+            .iter()
+            .any(render::font_subst::document_requests_font_families)
+    {
+        None
+    } else {
+        Some(render::font_context::resolve_font_search_context(
+            &options.font_paths,
+        ))
+    };
+
     for chunk_doc in chunk_docs {
         total_page_count += chunk_doc.pages.len() as u32;
 
         let codegen_start = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        let output = render::typst_gen::generate_typst_with_options_and_font_context(
+            &chunk_doc,
+            options,
+            font_context.as_ref(),
+        )?;
+        #[cfg(target_arch = "wasm32")]
         let output = render::typst_gen::generate_typst_with_options(&chunk_doc, options)?;
         codegen_duration_total += codegen_start.elapsed();
 
         let compile_start = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        let pdf = render::pdf::compile_to_pdf(
+            &output.source,
+            &output.images,
+            options.pdf_standard,
+            font_context
+                .as_ref()
+                .map(|context| context.search_paths())
+                .unwrap_or(&[]),
+            options.tagged,
+            options.pdf_ua,
+        )?;
+        #[cfg(target_arch = "wasm32")]
         let pdf = render::pdf::compile_to_pdf(
             &output.source,
             &output.images,
@@ -309,6 +441,7 @@ fn convert_bytes_streaming_xlsx(
 
     let total_duration = total_start.elapsed();
     let output_size_bytes = final_pdf.len() as u64;
+    dedup_warnings(&mut warnings);
 
     Ok(ConvertResult {
         pdf: final_pdf,
@@ -336,8 +469,32 @@ fn convert_bytes_streaming_xlsx(
 ///
 /// Returns [`ConvertError::Render`] if Typst compilation or PDF export fails.
 pub fn render_document(doc: &ir::Document) -> Result<Vec<u8>, ConvertError> {
-    let output = render::typst_gen::generate_typst(doc)?;
-    render::pdf::compile_to_pdf(&output.source, &output.images, None, &[], false, false)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let options = ConvertOptions::default();
+        let font_context = resolve_font_context_if_needed(doc, &options);
+        let output = render::typst_gen::generate_typst_with_options_and_font_context(
+            doc,
+            &options,
+            font_context.as_ref(),
+        )?;
+        render::pdf::compile_to_pdf(
+            &output.source,
+            &output.images,
+            None,
+            font_context
+                .as_ref()
+                .map(|context| context.search_paths())
+                .unwrap_or(&[]),
+            false,
+            false,
+        )
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let output = render::typst_gen::generate_typst(doc)?;
+        render::pdf::compile_to_pdf(&output.source, &output.images, None, &[], false, false)
+    }
 }
 
 #[cfg(test)]
@@ -660,6 +817,62 @@ mod tests {
         assert!(pdf.starts_with(b"%PDF"));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_should_resolve_font_context_false_for_default_document_without_user_paths() {
+        let doc = make_simple_document("Plain text");
+
+        assert!(!should_resolve_font_context(
+            &doc,
+            &ConvertOptions::default()
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_should_resolve_font_context_true_when_user_font_paths_are_provided() {
+        let doc = make_simple_document("Plain text");
+        let options = ConvertOptions {
+            font_paths: vec![std::env::temp_dir()],
+            ..ConvertOptions::default()
+        };
+
+        assert!(should_resolve_font_context(&doc, &options));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_should_resolve_font_context_true_when_document_requests_font_family() {
+        let doc = Document {
+            metadata: Metadata::default(),
+            pages: vec![Page::Flow(FlowPage {
+                size: PageSize::default(),
+                margins: Margins::default(),
+                content: vec![Block::Paragraph(Paragraph {
+                    style: ParagraphStyle::default(),
+                    runs: vec![Run {
+                        text: "Styled text".to_string(),
+                        style: TextStyle {
+                            font_family: Some("Pretendard".to_string()),
+                            ..TextStyle::default()
+                        },
+                        href: None,
+                        footnote: None,
+                    }],
+                })],
+                header: None,
+                footer: None,
+                columns: None,
+            })],
+            styles: StyleSheet::default(),
+        };
+
+        assert!(should_resolve_font_context(
+            &doc,
+            &ConvertOptions::default()
+        ));
+    }
+
     #[test]
     fn test_convert_with_options_delegates_to_convert_bytes() {
         // convert_with_options on a nonexistent file should produce an IO error,
@@ -733,6 +946,7 @@ mod tests {
                     format: ImageFormat::Png,
                     width: Some(100.0),
                     height: Some(80.0),
+                    crop: None,
                 })],
                 header: None,
                 footer: None,
@@ -767,6 +981,7 @@ mod tests {
                         format: ImageFormat::Png,
                         width: Some(200.0),
                         height: None,
+                        crop: None,
                     }),
                     Block::Paragraph(Paragraph {
                         style: ParagraphStyle::default(),
@@ -1829,6 +2044,7 @@ mod tests {
                     format: ir::ImageFormat::Png,
                     width: Some(100.0),
                     height: Some(100.0),
+                    crop: None,
                 })],
                 header: None,
                 footer: None,

@@ -9,16 +9,54 @@ use crate::config::ConvertOptions;
 use crate::error::{ConvertError, ConvertWarning};
 use crate::ir::{
     Alignment, Block, BorderLineStyle, BorderSide, CellBorder, Chart, Color, Document,
-    FixedElement, FixedElementKind, FixedPage, GradientFill, GradientStop, ImageData, ImageFormat,
-    Page, PageSize, Paragraph, ParagraphStyle, Run, Shadow, Shape, ShapeKind, SmartArt,
-    SmartArtNode, StyleSheet, Table, TableCell, TableRow, TextDirection, TextStyle,
+    FixedElement, FixedElementKind, FixedPage, GradientFill, GradientStop, ImageCrop, ImageData,
+    ImageFormat, Page, PageSize, Paragraph, ParagraphStyle, Run, Shadow, Shape, ShapeKind,
+    SmartArt, SmartArtNode, StyleSheet, Table, TableCell, TableRow, TextDirection, TextStyle,
 };
 use crate::parser::Parser;
 use crate::parser::chart as chart_parser;
 use crate::parser::smartart;
 
-/// Map from relationship ID → (image bytes, format).
-type SlideImageMap = HashMap<String, (Vec<u8>, ImageFormat)>;
+/// Relationship metadata from a `.rels` file.
+#[derive(Debug, Clone)]
+struct Relationship {
+    target: String,
+    rel_type: Option<String>,
+}
+
+/// Image asset referenced by a slide relationship.
+#[derive(Debug, Clone)]
+struct SlideImageAsset {
+    path: String,
+    data: Vec<u8>,
+    source: SlideImageSource,
+}
+
+impl SlideImageAsset {
+    fn format(&self) -> Option<ImageFormat> {
+        match self.source {
+            SlideImageSource::Supported(format) => Some(format),
+            SlideImageSource::Unsupported => None,
+        }
+    }
+
+    fn is_supported(&self) -> bool {
+        matches!(self.source, SlideImageSource::Supported(_))
+    }
+
+    fn file_name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(self.path.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlideImageSource {
+    Supported(ImageFormat),
+    Unsupported,
+}
+
+/// Map from relationship ID → slide image asset.
+type SlideImageMap = HashMap<String, SlideImageAsset>;
 
 /// Context for which element a `<a:solidFill>` belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,8 +146,16 @@ impl Parser for PptxParser {
                     format!("ppt/{target}")
                 };
 
-                match parse_single_slide(&slide_path, slide_size, &theme, &mut archive) {
-                    Ok(page) => {
+                let slide_label = format!("slide {slide_number}");
+                match parse_single_slide(
+                    &slide_path,
+                    &slide_label,
+                    slide_size,
+                    &theme,
+                    &mut archive,
+                ) {
+                    Ok((page, slide_warnings)) => {
+                        warnings.extend(slide_warnings);
                         // Emit structured warnings for fallback-rendered elements
                         if let Page::Fixed(ref fp) = page {
                             for elem in &fp.elements {
@@ -170,13 +216,17 @@ impl Parser for PptxParser {
 /// prepends master/layout elements behind slide elements.
 fn parse_single_slide<R: Read + std::io::Seek>(
     slide_path: &str,
+    slide_label: &str,
     slide_size: PageSize,
     theme: &ThemeData,
     archive: &mut ZipArchive<R>,
-) -> Result<Page, ConvertError> {
+) -> Result<(Page, Vec<ConvertWarning>), ConvertError> {
     let slide_xml = read_zip_entry(archive, slide_path)?;
     let slide_images = load_slide_images(slide_path, archive);
-    let slide_elements = parse_slide_xml(&slide_xml, &slide_images, theme)?;
+    let mut warnings = Vec::new();
+    let (slide_elements, slide_warnings) =
+        parse_slide_xml(&slide_xml, &slide_images, theme, slide_label)?;
+    warnings.extend(slide_warnings);
 
     // Resolve layout and master paths
     let (layout_path, master_path) = resolve_layout_master_paths(slide_path, archive);
@@ -189,8 +239,12 @@ fn parse_single_slide<R: Read + std::io::Seek>(
         && let Ok(xml) = read_zip_entry(archive, path)
     {
         let master_images = load_slide_images(path, archive);
-        if let Ok(master_elements) = parse_slide_xml(&xml, &master_images, theme) {
+        let master_label = format!("{slide_label} master");
+        if let Ok((master_elements, master_warnings)) =
+            parse_slide_xml(&xml, &master_images, theme, &master_label)
+        {
             elements.extend(master_elements);
+            warnings.extend(master_warnings);
         }
     }
 
@@ -199,8 +253,12 @@ fn parse_single_slide<R: Read + std::io::Seek>(
         && let Ok(xml) = read_zip_entry(archive, path)
     {
         let layout_images = load_slide_images(path, archive);
-        if let Ok(layout_elements) = parse_slide_xml(&xml, &layout_images, theme) {
+        let layout_label = format!("{slide_label} layout");
+        if let Ok((layout_elements, layout_warnings)) =
+            parse_slide_xml(&xml, &layout_images, theme, &layout_label)
+        {
             elements.extend(layout_elements);
+            warnings.extend(layout_warnings);
         }
     }
 
@@ -264,12 +322,15 @@ fn parse_single_slide<R: Read + std::io::Seek>(
         })
     };
 
-    Ok(Page::Fixed(FixedPage {
-        size: slide_size,
-        elements,
-        background_color,
-        background_gradient,
-    }))
+    Ok((
+        Page::Fixed(FixedPage {
+            size: slide_size,
+            elements,
+            background_color,
+            background_gradient,
+        }),
+        warnings,
+    ))
 }
 
 /// Build the .rels path for a given file path.
@@ -389,25 +450,34 @@ fn load_slide_images<R: Read + std::io::Seek>(
     };
 
     let slide_dir = slide_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-    let rel_map = parse_rels_xml(&rels_xml);
+    let rels = parse_relationships_xml(&rels_xml);
 
-    for (id, target) in &rel_map {
-        let format = match image_format_from_ext(target) {
-            Some(f) => f,
-            None => continue, // Not an image relationship
-        };
+    for (id, rel) in rels {
+        if !is_image_relationship(rel.rel_type.as_deref(), &rel.target) {
+            continue;
+        }
 
         // Resolve relative path (e.g., "../media/image1.png" → "ppt/media/image1.png")
-        let image_path = if let Some(stripped) = target.strip_prefix('/') {
+        let image_path = if let Some(stripped) = rel.target.strip_prefix('/') {
             stripped.to_string()
         } else {
-            resolve_relative_path(slide_dir, target)
+            resolve_relative_path(slide_dir, &rel.target)
         };
 
         if let Ok(mut file) = archive.by_name(&image_path) {
             let mut data = Vec::new();
             if file.read_to_end(&mut data).is_ok() {
-                images.insert(id.clone(), (data, format));
+                let source = image_format_from_ext(&rel.target)
+                    .map(SlideImageSource::Supported)
+                    .unwrap_or(SlideImageSource::Unsupported);
+                images.insert(
+                    id,
+                    SlideImageAsset {
+                        path: image_path,
+                        data,
+                        source,
+                    },
+                );
             }
         }
     }
@@ -617,9 +687,19 @@ fn image_format_from_ext(path: &str) -> Option<ImageFormat> {
         Some(ImageFormat::Bmp)
     } else if lower.ends_with(".tiff") || lower.ends_with(".tif") {
         Some(ImageFormat::Tiff)
+    } else if lower.ends_with(".svg") {
+        Some(ImageFormat::Svg)
     } else {
         None
     }
+}
+
+fn is_image_relationship(rel_type: Option<&str>, target: &str) -> bool {
+    image_format_from_ext(target).is_some()
+        || rel_type.is_some_and(|rel_type| {
+            let lower = rel_type.to_ascii_lowercase();
+            lower.contains("/image") || lower.contains("hdphoto")
+        })
 }
 
 /// Parse presentation.xml to extract slide size and ordered slide relationship IDs.
@@ -678,8 +758,8 @@ fn handle_presentation_element(
     }
 }
 
-/// Parse a .rels file to build Id → Target mapping.
-fn parse_rels_xml(xml: &str) -> HashMap<String, String> {
+/// Parse a .rels file to build Id → full relationship metadata mapping.
+fn parse_relationships_xml(xml: &str) -> HashMap<String, Relationship> {
     let mut map = HashMap::new();
     let mut reader = Reader::from_str(xml);
 
@@ -690,7 +770,13 @@ fn parse_rels_xml(xml: &str) -> HashMap<String, String> {
                     && let (Some(id), Some(target)) =
                         (get_attr_str(e, b"Id"), get_attr_str(e, b"Target"))
                 {
-                    map.insert(id, target);
+                    map.insert(
+                        id,
+                        Relationship {
+                            target,
+                            rel_type: get_attr_str(e, b"Type"),
+                        },
+                    );
                 }
             }
             Ok(Event::Start(ref e)) => {
@@ -698,7 +784,13 @@ fn parse_rels_xml(xml: &str) -> HashMap<String, String> {
                     && let (Some(id), Some(target)) =
                         (get_attr_str(e, b"Id"), get_attr_str(e, b"Target"))
                 {
-                    map.insert(id, target);
+                    map.insert(
+                        id,
+                        Relationship {
+                            target,
+                            rel_type: get_attr_str(e, b"Type"),
+                        },
+                    );
                 }
             }
             Ok(Event::Eof) => break,
@@ -708,6 +800,14 @@ fn parse_rels_xml(xml: &str) -> HashMap<String, String> {
     }
 
     map
+}
+
+/// Parse a .rels file to build Id → Target mapping.
+fn parse_rels_xml(xml: &str) -> HashMap<String, String> {
+    parse_relationships_xml(xml)
+        .into_iter()
+        .map(|(id, rel)| (id, rel.target))
+        .collect()
 }
 
 /// Find and load theme data from the PPTX archive.
@@ -1599,7 +1699,8 @@ fn parse_group_shape(
     xml: &str,
     images: &SlideImageMap,
     theme: &ThemeData,
-) -> Result<Vec<FixedElement>, ConvertError> {
+    warning_context: &str,
+) -> Result<(Vec<FixedElement>, Vec<ConvertWarning>), ConvertError> {
     let mut transform = GroupTransform::default();
     let mut in_xfrm = false;
     let mut header_depth: usize = 0;
@@ -1646,10 +1747,10 @@ fn parse_group_shape(
                 }
                 b"nvGrpSpPr" if header_depth == 1 => header_depth = 0,
                 _ if header_depth > 1 => header_depth -= 1,
-                b"grpSp" => return Ok(Vec::new()), // empty group
+                b"grpSp" => return Ok((Vec::new(), Vec::new())), // empty group
                 _ => {}
             },
-            Ok(Event::Eof) => return Ok(Vec::new()),
+            Ok(Event::Eof) => return Ok((Vec::new(), Vec::new())),
             Err(e) => {
                 return Err(ConvertError::Parse(format!(
                     "XML error in group shape: {e}"
@@ -1672,21 +1773,22 @@ fn parse_group_shape(
                 if grp_depth == 0 {
                     let children_xml = &xml[children_start..pos];
                     if children_xml.trim().is_empty() {
-                        return Ok(Vec::new());
+                        return Ok((Vec::new(), Vec::new()));
                     }
 
                     let wrapped = format!(
                         r#"<r xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">{children_xml}</r>"#
                     );
 
-                    let mut child_elements = parse_slide_xml(&wrapped, images, theme)?;
+                    let (mut child_elements, warnings) =
+                        parse_slide_xml(&wrapped, images, theme, warning_context)?;
                     for elem in &mut child_elements {
                         transform.apply(elem);
                     }
-                    return Ok(child_elements);
+                    return Ok((child_elements, warnings));
                 }
             }
-            Ok(Event::Eof) => return Ok(Vec::new()),
+            Ok(Event::Eof) => return Ok((Vec::new(), Vec::new())),
             Err(e) => {
                 return Err(ConvertError::Parse(format!(
                     "XML error in group shape: {e}"
@@ -1697,14 +1799,101 @@ fn parse_group_shape(
     }
 }
 
+fn parse_crop_fraction(e: &quick_xml::events::BytesStart, key: &[u8]) -> f64 {
+    get_attr_i64(e, key)
+        .map(|value| (value as f64 / 100_000.0).clamp(0.0, 1.0))
+        .unwrap_or(0.0)
+}
+
+fn parse_src_rect(e: &quick_xml::events::BytesStart) -> Option<ImageCrop> {
+    let crop = ImageCrop {
+        left: parse_crop_fraction(e, b"l"),
+        top: parse_crop_fraction(e, b"t"),
+        right: parse_crop_fraction(e, b"r"),
+        bottom: parse_crop_fraction(e, b"b"),
+    };
+    (!crop.is_empty()).then_some(crop)
+}
+
+fn describe_assets(assets: impl IntoIterator<Item = String>) -> String {
+    assets.into_iter().collect::<Vec<_>>().join(", ")
+}
+
+fn pick_supported_asset(rid: &str, images: &SlideImageMap) -> Option<SlideImageAsset> {
+    images
+        .get(rid)
+        .filter(|asset| asset.is_supported())
+        .cloned()
+}
+
+fn select_picture_asset(
+    images: &SlideImageMap,
+    warning_context: &str,
+    base_rid: Option<&str>,
+    svg_rid: Option<&str>,
+    img_layer_rids: &[String],
+) -> (Option<SlideImageAsset>, Vec<ConvertWarning>) {
+    let mut warnings = Vec::new();
+
+    let unsupported_layers: Vec<String> = img_layer_rids
+        .iter()
+        .filter_map(|rid| images.get(rid))
+        .filter(|asset| !asset.is_supported())
+        .map(|asset| asset.file_name().to_string())
+        .collect();
+    if !unsupported_layers.is_empty() {
+        warnings.push(ConvertWarning::PartialElement {
+            format: "PPTX".to_string(),
+            element: format!("{warning_context} picture"),
+            detail: format!(
+                "unsupported image layer omitted: {}",
+                describe_assets(unsupported_layers)
+            ),
+        });
+    }
+
+    let selected = svg_rid
+        .and_then(|rid| pick_supported_asset(rid, images))
+        .or_else(|| base_rid.and_then(|rid| pick_supported_asset(rid, images)))
+        .or_else(|| {
+            img_layer_rids
+                .iter()
+                .find_map(|rid| pick_supported_asset(rid, images))
+        });
+    if selected.is_some() {
+        return (selected, warnings);
+    }
+
+    let omitted_assets = svg_rid
+        .into_iter()
+        .chain(base_rid)
+        .chain(img_layer_rids.iter().map(String::as_str))
+        .filter_map(|rid| images.get(rid))
+        .map(|asset| asset.file_name().to_string())
+        .collect::<Vec<_>>();
+    if !omitted_assets.is_empty() {
+        warnings.push(ConvertWarning::UnsupportedElement {
+            format: "PPTX".to_string(),
+            element: format!(
+                "{warning_context} image omitted: {}",
+                describe_assets(omitted_assets)
+            ),
+        });
+    }
+
+    (None, warnings)
+}
+
 /// Parse a slide XML to extract positioned elements (text boxes, shapes, images).
 fn parse_slide_xml(
     xml: &str,
     images: &SlideImageMap,
     theme: &ThemeData,
-) -> Result<Vec<FixedElement>, ConvertError> {
+    warning_context: &str,
+) -> Result<(Vec<FixedElement>, Vec<ConvertWarning>), ConvertError> {
     let mut reader = Reader::from_str(xml);
     let mut elements = Vec::new();
+    let mut warnings = Vec::new();
 
     // ── Shape-level state ────────────────────────────────────────────────
     let mut in_shape = false;
@@ -1756,6 +1945,9 @@ fn parse_slide_xml(
     let mut pic_cx: i64 = 0;
     let mut pic_cy: i64 = 0;
     let mut blip_embed: Option<String> = None;
+    let mut svg_blip_embed: Option<String> = None;
+    let mut img_layer_embeds: Vec<String> = Vec::new();
+    let mut pic_crop: Option<ImageCrop> = None;
     let mut in_pic_xfrm = false;
 
     // ── GraphicFrame-level state (for tables and SmartArt) ─────────────
@@ -1797,9 +1989,11 @@ fn parse_slide_xml(
                     }
                     // ── Group shape start ────────────────────────────
                     b"grpSp" if !in_shape && !in_pic && !in_graphic_frame => {
-                        if let Ok(group_elems) = parse_group_shape(&mut reader, xml, images, theme)
+                        if let Ok((group_elems, group_warnings)) =
+                            parse_group_shape(&mut reader, xml, images, theme, warning_context)
                         {
                             elements.extend(group_elems);
+                            warnings.extend(group_warnings);
                         }
                     }
 
@@ -1942,6 +2136,9 @@ fn parse_slide_xml(
                         pic_cx = 0;
                         pic_cy = 0;
                         blip_embed = None;
+                        svg_blip_embed = None;
+                        img_layer_embeds.clear();
+                        pic_crop = None;
                         in_pic_xfrm = false;
                     }
                     b"spPr" if in_pic => {
@@ -1951,6 +2148,20 @@ fn parse_slide_xml(
                         in_pic_xfrm = true;
                     }
                     b"blipFill" if in_pic => {}
+                    b"blip" if in_pic => {
+                        blip_embed = get_attr_str(e, b"r:embed");
+                    }
+                    b"svgBlip" if in_pic => {
+                        svg_blip_embed = get_attr_str(e, b"r:embed");
+                    }
+                    b"imgLayer" if in_pic => {
+                        if let Some(rid) = get_attr_str(e, b"r:embed") {
+                            img_layer_embeds.push(rid);
+                        }
+                    }
+                    b"srcRect" if in_pic => {
+                        pic_crop = parse_src_rect(e);
+                    }
 
                     _ => {}
                 }
@@ -1991,6 +2202,17 @@ fn parse_slide_xml(
                     // ── Blip (image reference) ───────────────────────
                     b"blip" if in_pic => {
                         blip_embed = get_attr_str(e, b"r:embed");
+                    }
+                    b"svgBlip" if in_pic => {
+                        svg_blip_embed = get_attr_str(e, b"r:embed");
+                    }
+                    b"imgLayer" if in_pic => {
+                        if let Some(rid) = get_attr_str(e, b"r:embed") {
+                            img_layer_embeds.push(rid);
+                        }
+                    }
+                    b"srcRect" if in_pic => {
+                        pic_crop = parse_src_rect(e);
                     }
 
                     // ── Preset geometry (empty element) ──────────────
@@ -2161,8 +2383,16 @@ fn parse_slide_xml(
 
                     // ── Picture end ──────────────────────────────────
                     b"pic" if in_pic => {
-                        if let Some(ref rid) = blip_embed
-                            && let Some((data, format)) = images.get(rid)
+                        let (selected_asset, picture_warnings) = select_picture_asset(
+                            images,
+                            warning_context,
+                            blip_embed.as_deref(),
+                            svg_blip_embed.as_deref(),
+                            &img_layer_embeds,
+                        );
+                        warnings.extend(picture_warnings);
+                        if let Some(asset) = selected_asset
+                            && let Some(format) = asset.format()
                         {
                             elements.push(FixedElement {
                                 x: emu_to_pt(pic_x),
@@ -2170,10 +2400,11 @@ fn parse_slide_xml(
                                 width: emu_to_pt(pic_cx),
                                 height: emu_to_pt(pic_cy),
                                 kind: FixedElementKind::Image(ImageData {
-                                    data: data.clone(),
-                                    format: *format,
+                                    data: asset.data.clone(),
+                                    format,
                                     width: Some(emu_to_pt(pic_cx)),
                                     height: Some(emu_to_pt(pic_cy)),
+                                    crop: pic_crop,
                                 }),
                             });
                         }
@@ -2200,7 +2431,7 @@ fn parse_slide_xml(
         }
     }
 
-    Ok(elements)
+    Ok((elements, warnings))
 }
 
 /// Resolve a font typeface, substituting theme font references.
@@ -2399,6 +2630,7 @@ fn parse_hex_color(hex: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::ImageCrop;
     use std::io::Write;
     use zip::write::FileOptions;
 
@@ -2947,10 +3179,26 @@ mod tests {
         bmp
     }
 
+    /// Create a minimal valid SVG image for test images.
+    fn make_test_svg() -> Vec<u8> {
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1" viewBox="0 0 1 1"><rect width="1" height="1" fill="#ff0000"/></svg>"##.to_vec()
+    }
+
     /// Create a picture XML element referencing an image via relationship ID.
     fn make_pic_xml(x: i64, y: i64, cx: i64, cy: i64, r_embed: &str) -> String {
+        make_custom_pic_xml(
+            x,
+            y,
+            cx,
+            cy,
+            &format!(r#"<a:blip r:embed="{r_embed}"/><a:stretch><a:fillRect/></a:stretch>"#),
+        )
+    }
+
+    /// Create a picture XML element with custom `<p:blipFill>` contents.
+    fn make_custom_pic_xml(x: i64, y: i64, cx: i64, cy: i64, blip_fill_xml: &str) -> String {
         format!(
-            r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="Picture"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="{r_embed}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm></p:spPr></p:pic>"#
+            r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="Picture"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill>{blip_fill_xml}</p:blipFill><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm></p:spPr></p:pic>"#
         )
     }
 
@@ -2959,6 +3207,7 @@ mod tests {
         rid: String,
         path: String,
         data: Vec<u8>,
+        relationship_type: Option<String>,
     }
 
     /// Build a PPTX file with slides that have image relationships.
@@ -2980,6 +3229,7 @@ mod tests {
         ct.push_str(r#"<Default Extension="png" ContentType="image/png"/>"#);
         ct.push_str(r#"<Default Extension="bmp" ContentType="image/bmp"/>"#);
         ct.push_str(r#"<Default Extension="jpeg" ContentType="image/jpeg"/>"#);
+        ct.push_str(r#"<Default Extension="svg" ContentType="image/svg+xml"/>"#);
         for i in 0..slides.len() {
             ct.push_str(&format!(
                 r#"<Override PartName="/ppt/slides/slide{}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>"#,
@@ -3045,8 +3295,12 @@ mod tests {
                 );
                 for img in slide_images {
                     rels.push_str(&format!(
-                        r#"<Relationship Id="{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{}"/>"#,
-                        img.rid, img.path
+                        r#"<Relationship Id="{}" Type="{}" Target="{}"/>"#,
+                        img.rid,
+                        img.relationship_type
+                            .as_deref()
+                            .unwrap_or("http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"),
+                        img.path
                     ));
                 }
                 rels.push_str("</Relationships>");
@@ -3281,6 +3535,7 @@ mod tests {
             rid: "rId3".to_string(),
             path: "../media/image1.bmp".to_string(),
             data: bmp_data.clone(),
+            relationship_type: None,
         }];
         let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
         let parser = PptxParser;
@@ -3311,6 +3566,7 @@ mod tests {
             rid: "rId3".to_string(),
             path: "../media/image1.bmp".to_string(),
             data: bmp_data,
+            relationship_type: None,
         }];
         let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
         let parser = PptxParser;
@@ -3319,6 +3575,209 @@ mod tests {
         let page = first_fixed_page(&doc);
         let img = get_image(&page.elements[0]);
         assert_eq!(img.format, ImageFormat::Bmp);
+    }
+
+    #[test]
+    fn test_svg_image_extraction() {
+        let svg_data = make_test_svg();
+
+        let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+        let slide_xml = make_slide_xml(&[pic]);
+        let slide_images = vec![TestSlideImage {
+            rid: "rId3".to_string(),
+            path: "../media/image1.svg".to_string(),
+            data: svg_data.clone(),
+            relationship_type: None,
+        }];
+        let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+        let parser = PptxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        let page = first_fixed_page(&doc);
+        assert_eq!(page.elements.len(), 1, "Expected 1 image element");
+
+        let img = get_image(&page.elements[0]);
+        assert_eq!(img.format, ImageFormat::Svg);
+        assert_eq!(img.data, svg_data);
+    }
+
+    #[test]
+    fn test_image_blip_start_tag_with_children_is_extracted() {
+        let bmp_data = make_test_bmp();
+        let pic = make_custom_pic_xml(
+            0,
+            0,
+            1_000_000,
+            1_000_000,
+            r#"<a:blip r:embed="rId3"><a:extLst><a:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}"/></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch>"#,
+        );
+        let slide_xml = make_slide_xml(&[pic]);
+        let slide_images = vec![TestSlideImage {
+            rid: "rId3".to_string(),
+            path: "../media/image1.bmp".to_string(),
+            data: bmp_data.clone(),
+            relationship_type: None,
+        }];
+        let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+        let parser = PptxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        let page = first_fixed_page(&doc);
+        assert_eq!(page.elements.len(), 1, "Expected 1 image element");
+
+        let img = get_image(&page.elements[0]);
+        assert_eq!(img.data, bmp_data);
+    }
+
+    #[test]
+    fn test_svg_blip_is_preferred_over_base_raster() {
+        let bmp_data = make_test_bmp();
+        let svg_data = make_test_svg();
+        let pic = make_custom_pic_xml(
+            0,
+            0,
+            1_000_000,
+            1_000_000,
+            r#"<a:blip r:embed="rId3"><a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}"><asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="rId4"/></a:ext></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch>"#,
+        );
+        let slide_xml = make_slide_xml(&[pic]);
+        let slide_images = vec![
+            TestSlideImage {
+                rid: "rId3".to_string(),
+                path: "../media/image1.bmp".to_string(),
+                data: bmp_data,
+                relationship_type: None,
+            },
+            TestSlideImage {
+                rid: "rId4".to_string(),
+                path: "../media/image2.svg".to_string(),
+                data: svg_data.clone(),
+                relationship_type: None,
+            },
+        ];
+        let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+        let parser = PptxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        let page = first_fixed_page(&doc);
+        let img = get_image(&page.elements[0]);
+        assert_eq!(img.format, ImageFormat::Svg);
+        assert_eq!(img.data, svg_data);
+    }
+
+    #[test]
+    fn test_src_rect_crop_is_extracted() {
+        let bmp_data = make_test_bmp();
+        let pic = make_custom_pic_xml(
+            0,
+            0,
+            2_000_000,
+            1_000_000,
+            r#"<a:blip r:embed="rId3"/><a:srcRect l="25000" t="10000" r="5000" b="20000"/><a:stretch><a:fillRect/></a:stretch>"#,
+        );
+        let slide_xml = make_slide_xml(&[pic]);
+        let slide_images = vec![TestSlideImage {
+            rid: "rId3".to_string(),
+            path: "../media/image1.bmp".to_string(),
+            data: bmp_data,
+            relationship_type: None,
+        }];
+        let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+        let parser = PptxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        let page = first_fixed_page(&doc);
+        let img = get_image(&page.elements[0]);
+        assert_eq!(
+            img.crop,
+            Some(ImageCrop {
+                left: 0.25,
+                top: 0.10,
+                right: 0.05,
+                bottom: 0.20,
+            })
+        );
+    }
+
+    #[test]
+    fn test_unsupported_img_layer_emits_partial_warning_but_keeps_base_image() {
+        let bmp_data = make_test_bmp();
+        let pic = make_custom_pic_xml(
+            0,
+            0,
+            1_000_000,
+            1_000_000,
+            r#"<a:blip r:embed="rId3"><a:extLst><a:ext uri="{BEBA8EAE-BF5A-486C-A8C5-ECC9F3942E4B}"><a14:imgProps xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"><a14:imgLayer r:embed="rId4"/></a14:imgProps></a:ext></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch>"#,
+        );
+        let slide_xml = make_slide_xml(&[pic]);
+        let slide_images = vec![
+            TestSlideImage {
+                rid: "rId3".to_string(),
+                path: "../media/image1.bmp".to_string(),
+                data: bmp_data.clone(),
+                relationship_type: None,
+            },
+            TestSlideImage {
+                rid: "rId4".to_string(),
+                path: "../media/image2.wdp".to_string(),
+                data: vec![0x00, 0x01, 0x02],
+                relationship_type: Some(
+                    "http://schemas.microsoft.com/office/2007/relationships/hdphoto".to_string(),
+                ),
+            },
+        ];
+        let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+        let parser = PptxParser;
+        let (doc, warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        let page = first_fixed_page(&doc);
+        assert_eq!(page.elements.len(), 1, "Base image should still render");
+        assert_eq!(get_image(&page.elements[0]).data, bmp_data);
+        assert!(
+            warnings.iter().any(|warning| matches!(
+                warning,
+                ConvertWarning::PartialElement { format, element, detail }
+                    if format == "PPTX"
+                        && element.contains("slide 1")
+                        && detail.contains("image layer")
+                        && detail.contains("image2.wdp")
+            )),
+            "Expected partial warning for unsupported image layer, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_wdp_only_picture_emits_unsupported_warning() {
+        let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+        let slide_xml = make_slide_xml(&[pic]);
+        let slide_images = vec![TestSlideImage {
+            rid: "rId3".to_string(),
+            path: "../media/image1.wdp".to_string(),
+            data: vec![0x00, 0x01, 0x02],
+            relationship_type: Some(
+                "http://schemas.microsoft.com/office/2007/relationships/hdphoto".to_string(),
+            ),
+        }];
+        let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+        let parser = PptxParser;
+        let (doc, warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        let page = first_fixed_page(&doc);
+        assert_eq!(
+            page.elements.len(),
+            0,
+            "Unsupported WDP image should be omitted"
+        );
+        assert!(
+            warnings.iter().any(|warning| matches!(
+                warning,
+                ConvertWarning::UnsupportedElement { format, element }
+                    if format == "PPTX"
+                        && element.contains("slide 1")
+                        && element.contains("image1.wdp")
+            )),
+            "Expected unsupported warning for WDP-only picture, got: {warnings:?}"
+        );
     }
 
     #[test]
@@ -3331,6 +3790,7 @@ mod tests {
             rid: "rId3".to_string(),
             path: "../media/image1.bmp".to_string(),
             data: bmp_data,
+            relationship_type: None,
         }];
         let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
         let parser = PptxParser;
@@ -3364,6 +3824,7 @@ mod tests {
             rid: "rId3".to_string(),
             path: "../media/image1.bmp".to_string(),
             data: bmp_data,
+            relationship_type: None,
         }];
         let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
         let parser = PptxParser;
@@ -3407,11 +3868,13 @@ mod tests {
                 rid: "rId3".to_string(),
                 path: "../media/image1.bmp".to_string(),
                 data: bmp_data.clone(),
+                relationship_type: None,
             },
             TestSlideImage {
                 rid: "rId4".to_string(),
                 path: "../media/image2.bmp".to_string(),
                 data: bmp_data,
+                relationship_type: None,
             },
         ];
         let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
