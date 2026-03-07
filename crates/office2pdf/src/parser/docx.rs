@@ -2911,6 +2911,7 @@ fn extract_shape_image(shape: &docx_rs::Shape, images: &ImageMap) -> Option<Bloc
         format: ImageFormat::Png,
         width,
         height,
+        crop: None,
     }))
 }
 
