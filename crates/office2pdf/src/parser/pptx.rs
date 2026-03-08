@@ -3096,10 +3096,10 @@ fn parse_pptx_list_style(
     let mut in_ln_spc = false;
     let mut in_run_fill = false;
 
-    fn paragraph_style_mut<'a>(
-        defaults: &'a mut PptxTextBodyStyleDefaults,
+    fn paragraph_style_mut(
+        defaults: &mut PptxTextBodyStyleDefaults,
         target: ParagraphTarget,
-    ) -> &'a mut ParagraphStyle {
+    ) -> &mut ParagraphStyle {
         match target {
             ParagraphTarget::Default => &mut defaults.default_paragraph,
             ParagraphTarget::Level(level) => {
@@ -3108,10 +3108,10 @@ fn parse_pptx_list_style(
         }
     }
 
-    fn run_style_mut<'a>(
-        defaults: &'a mut PptxTextBodyStyleDefaults,
+    fn run_style_mut(
+        defaults: &mut PptxTextBodyStyleDefaults,
         target: ParagraphTarget,
-    ) -> &'a mut TextStyle {
+    ) -> &mut TextStyle {
         match target {
             ParagraphTarget::Default => &mut defaults.default_run,
             ParagraphTarget::Level(level) => &mut defaults.levels.entry(level).or_default().run,
