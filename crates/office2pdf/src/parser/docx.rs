@@ -10,15 +10,20 @@ use crate::error::{ConvertError, ConvertWarning};
 const MAX_TABLE_DEPTH: usize = 64;
 use crate::ir::{
     Alignment, Block, BorderLineStyle, BorderSide, CellBorder, CellVerticalAlign, Chart, Color,
-    ColumnLayout, Document, FloatingImage, FloatingTextBox, FlowPage, HFInline, HeaderFooter,
-    HeaderFooterParagraph, ImageData, ImageFormat, Insets, LineSpacing, Margins, MathEquation,
-    Page, PageSize, Paragraph, ParagraphStyle, Run, StyleSheet, TabAlignment, TabLeader, TabStop,
-    Table, TableCell, TableRow, TextDirection, TextStyle, VerticalTextAlign, WrapMode,
+    ColumnLayout, Document, FloatingImage, FloatingTextBox, ImageData, ImageFormat, Insets,
+    LineSpacing, MathEquation, Page, Paragraph, ParagraphStyle, Run, StyleSheet, TabAlignment,
+    TabLeader, TabStop, Table, TableCell, TableRow, TextDirection, TextStyle, VerticalTextAlign,
+    WrapMode,
 };
 use crate::parser::Parser;
 
 use self::lists::{
     NumberingMap, TaggedElement, build_numbering_map, extract_num_info, group_into_lists,
+};
+#[cfg(test)]
+use self::sections::extract_page_size;
+use self::sections::{
+    HeaderFooterAssets, build_flow_page_from_section, build_header_footer_assets,
 };
 use self::styles::{
     DOC_DEFAULT_STYLE_ID, ResolvedStyle, StyleMap, TabStopOverride, apply_tab_stop_overrides,
@@ -27,6 +32,8 @@ use self::styles::{
 
 #[path = "docx_lists.rs"]
 mod lists;
+#[path = "docx_sections.rs"]
+mod sections;
 #[path = "docx_styles.rs"]
 mod styles;
 
@@ -39,13 +46,6 @@ type ImageMap = HashMap<String, Vec<u8>>;
 /// Map from relationship ID → hyperlink URL.
 type HyperlinkMap = HashMap<String, String>;
 
-/// Parsed header/footer assets addressed by relationship ID.
-#[derive(Default)]
-struct HeaderFooterAssets {
-    headers: HashMap<String, HeaderFooter>,
-    footers: HashMap<String, HeaderFooter>,
-}
-
 /// Build a lookup map from the DOCX's hyperlinks (reader-populated field).
 /// The reader stores hyperlinks as `(rid, url, type)` in `docx.hyperlinks`.
 fn build_hyperlink_map(docx: &docx_rs::Docx) -> HyperlinkMap {
@@ -53,108 +53,6 @@ fn build_hyperlink_map(docx: &docx_rs::Docx) -> HyperlinkMap {
         .iter()
         .map(|(rid, url, _type)| (rid.clone(), url.clone()))
         .collect()
-}
-
-fn scan_header_footer_relationships(
-    rels_xml: &str,
-) -> (HashMap<String, String>, HashMap<String, String>) {
-    let mut headers: HashMap<String, String> = HashMap::new();
-    let mut footers: HashMap<String, String> = HashMap::new();
-    let mut reader = quick_xml::Reader::from_str(rels_xml);
-
-    loop {
-        match reader.read_event() {
-            Ok(quick_xml::events::Event::Start(ref e))
-            | Ok(quick_xml::events::Event::Empty(ref e)) => {
-                if e.local_name().as_ref() != b"Relationship" {
-                    continue;
-                }
-
-                let mut id: Option<String> = None;
-                let mut target: Option<String> = None;
-                let mut rel_type: Option<String> = None;
-
-                for attr in e.attributes().flatten() {
-                    match attr.key.local_name().as_ref() {
-                        b"Id" => {
-                            if let Ok(value) = attr.unescape_value() {
-                                id = Some(value.to_string());
-                            }
-                        }
-                        b"Target" => {
-                            if let Ok(value) = attr.unescape_value() {
-                                target = Some(value.to_string());
-                            }
-                        }
-                        b"Type" => {
-                            if let Ok(value) = attr.unescape_value() {
-                                rel_type = Some(value.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                let Some(id) = id else { continue };
-                let Some(target) = target else { continue };
-                let Some(rel_type) = rel_type else { continue };
-
-                let full_path = if let Some(stripped) = target.strip_prefix('/') {
-                    stripped.to_string()
-                } else {
-                    format!("word/{target}")
-                };
-
-                if rel_type.ends_with("/header") {
-                    headers.insert(id, full_path);
-                } else if rel_type.ends_with("/footer") {
-                    footers.insert(id, full_path);
-                }
-            }
-            Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-    }
-
-    (headers, footers)
-}
-
-fn build_header_footer_assets<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-) -> HeaderFooterAssets {
-    let rels_xml = match read_zip_text(archive, "word/_rels/document.xml.rels") {
-        Some(xml) => xml,
-        None => return HeaderFooterAssets::default(),
-    };
-    let (header_rels, footer_rels) = scan_header_footer_relationships(&rels_xml);
-    let mut assets = HeaderFooterAssets::default();
-
-    for (rid, path) in header_rels {
-        let Some(xml) = read_zip_text(archive, &path) else {
-            continue;
-        };
-        let Ok(header) = <docx_rs::Header as docx_rs::FromXML>::from_xml(xml.as_bytes()) else {
-            continue;
-        };
-        if let Some(converted) = convert_docx_header(&header) {
-            assets.headers.insert(rid, converted);
-        }
-    }
-
-    for (rid, path) in footer_rels {
-        let Some(xml) = read_zip_text(archive, &path) else {
-            continue;
-        };
-        let Ok(footer) = <docx_rs::Footer as docx_rs::FromXML>::from_xml(xml.as_bytes()) else {
-            continue;
-        };
-        if let Some(converted) = convert_docx_footer(&footer) {
-            assets.footers.insert(rid, converted);
-        }
-    }
-
-    assets
 }
 
 /// Build a lookup map from the DOCX's embedded images.
@@ -1350,79 +1248,6 @@ fn is_note_reference_run(run: &docx_rs::Run, notes: &NoteContext) -> bool {
     false
 }
 
-fn build_flow_page_from_section(
-    section_prop: &docx_rs::SectionProperty,
-    elements: Vec<TaggedElement>,
-    numberings: &NumberingMap,
-    header_footer_assets: &HeaderFooterAssets,
-    column_layout: Option<ColumnLayout>,
-    warnings: &mut Vec<ConvertWarning>,
-) -> FlowPage {
-    let (size, margins) = extract_page_setup(section_prop);
-    let content = group_into_lists(elements, numberings);
-
-    for block in &content {
-        if let Block::Chart(chart) = block {
-            let title = chart.title.as_deref().unwrap_or("untitled").to_string();
-            warnings.push(ConvertWarning::FallbackUsed {
-                format: "DOCX".to_string(),
-                from: format!("chart ({title})"),
-                to: "data table".to_string(),
-            });
-        }
-    }
-
-    if matches!(
-        section_prop.section_type,
-        Some(docx_rs::SectionType::Continuous | docx_rs::SectionType::NextColumn)
-    ) {
-        warnings.push(ConvertWarning::FallbackUsed {
-            format: "DOCX".to_string(),
-            from: "continuous section break".to_string(),
-            to: "page-level section split".to_string(),
-        });
-    }
-
-    if section_prop.first_header_reference.is_some()
-        || section_prop.first_footer_reference.is_some()
-        || section_prop.even_header_reference.is_some()
-        || section_prop.even_footer_reference.is_some()
-        || section_prop.first_header.is_some()
-        || section_prop.first_footer.is_some()
-        || section_prop.even_header.is_some()
-        || section_prop.even_footer.is_some()
-    {
-        warnings.push(ConvertWarning::FallbackUsed {
-            format: "DOCX".to_string(),
-            from: "header/footer variants".to_string(),
-            to: "single header/footer per section".to_string(),
-        });
-    }
-
-    if section_prop
-        .page_num_type
-        .as_ref()
-        .and_then(|page_num_type| page_num_type.start)
-        .is_some()
-    {
-        warnings.push(ConvertWarning::FallbackUsed {
-            format: "DOCX".to_string(),
-            from: "section page number restart".to_string(),
-            to: "global page counter".to_string(),
-        });
-    }
-
-    FlowPage {
-        size,
-        margins,
-        content,
-        header: extract_docx_header(section_prop, header_footer_assets),
-        footer: extract_docx_footer(section_prop, header_footer_assets),
-        columns: column_layout
-            .or_else(|| extract_column_layout_from_section_property(section_prop)),
-    }
-}
-
 impl Parser for DocxParser {
     fn parse(
         &self,
@@ -1653,262 +1478,6 @@ impl Parser for DocxParser {
             },
             warnings,
         ))
-    }
-}
-
-fn convert_docx_header(header: &docx_rs::Header) -> Option<HeaderFooter> {
-    let paragraphs = header
-        .children
-        .iter()
-        .filter_map(|child| match child {
-            docx_rs::HeaderChild::Paragraph(para) => Some(convert_hf_paragraph(para)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if paragraphs.is_empty() {
-        return None;
-    }
-    Some(HeaderFooter { paragraphs })
-}
-
-fn convert_docx_footer(footer: &docx_rs::Footer) -> Option<HeaderFooter> {
-    let paragraphs = footer
-        .children
-        .iter()
-        .filter_map(|child| match child {
-            docx_rs::FooterChild::Paragraph(para) => Some(convert_hf_paragraph(para)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if paragraphs.is_empty() {
-        return None;
-    }
-    Some(HeaderFooter { paragraphs })
-}
-
-/// Extract the header for a section, preferring the default variant and falling back to
-/// first/even variants when that is all the source document provides.
-fn extract_docx_header(
-    section_prop: &docx_rs::SectionProperty,
-    assets: &HeaderFooterAssets,
-) -> Option<HeaderFooter> {
-    section_prop
-        .header
-        .as_ref()
-        .and_then(|(_rid, header)| convert_docx_header(header))
-        .or_else(|| {
-            section_prop
-                .header_reference
-                .as_ref()
-                .and_then(|reference| assets.headers.get(&reference.id).cloned())
-        })
-        .or_else(|| {
-            section_prop
-                .first_header
-                .as_ref()
-                .and_then(|(_rid, header)| convert_docx_header(header))
-        })
-        .or_else(|| {
-            section_prop
-                .first_header_reference
-                .as_ref()
-                .and_then(|reference| assets.headers.get(&reference.id).cloned())
-        })
-        .or_else(|| {
-            section_prop
-                .even_header
-                .as_ref()
-                .and_then(|(_rid, header)| convert_docx_header(header))
-        })
-        .or_else(|| {
-            section_prop
-                .even_header_reference
-                .as_ref()
-                .and_then(|reference| assets.headers.get(&reference.id).cloned())
-        })
-}
-
-/// Extract the footer for a section, preferring the default variant and falling back to
-/// first/even variants when that is all the source document provides.
-fn extract_docx_footer(
-    section_prop: &docx_rs::SectionProperty,
-    assets: &HeaderFooterAssets,
-) -> Option<HeaderFooter> {
-    section_prop
-        .footer
-        .as_ref()
-        .and_then(|(_rid, footer)| convert_docx_footer(footer))
-        .or_else(|| {
-            section_prop
-                .footer_reference
-                .as_ref()
-                .and_then(|reference| assets.footers.get(&reference.id).cloned())
-        })
-        .or_else(|| {
-            section_prop
-                .first_footer
-                .as_ref()
-                .and_then(|(_rid, footer)| convert_docx_footer(footer))
-        })
-        .or_else(|| {
-            section_prop
-                .first_footer_reference
-                .as_ref()
-                .and_then(|reference| assets.footers.get(&reference.id).cloned())
-        })
-        .or_else(|| {
-            section_prop
-                .even_footer
-                .as_ref()
-                .and_then(|(_rid, footer)| convert_docx_footer(footer))
-        })
-        .or_else(|| {
-            section_prop
-                .even_footer_reference
-                .as_ref()
-                .and_then(|reference| assets.footers.get(&reference.id).cloned())
-        })
-}
-
-/// Convert a docx-rs Paragraph into a HeaderFooterParagraph.
-/// Detects PAGE/NUMPAGES field codes within runs and emits page counter inlines.
-fn convert_hf_paragraph(para: &docx_rs::Paragraph) -> HeaderFooterParagraph {
-    let explicit_style = extract_paragraph_style(&para.property);
-    let explicit_tab_overrides = extract_tab_stop_overrides(&para.property.tabs);
-    let style = merge_paragraph_style(&explicit_style, explicit_tab_overrides.as_deref(), None);
-    let mut elements: Vec<HFInline> = Vec::new();
-
-    for child in &para.children {
-        if let docx_rs::ParagraphChild::Run(run) = child {
-            let run_style = extract_run_style(&run.run_property);
-            extract_hf_run_elements(&run.children, &run_style, &mut elements);
-        }
-    }
-
-    HeaderFooterParagraph { style, elements }
-}
-
-/// Extract inline elements from a run's children for header/footer use.
-/// Recognizes text, tabs, and PAGE/NUMPAGES field codes.
-fn extract_hf_run_elements(
-    children: &[docx_rs::RunChild],
-    style: &TextStyle,
-    elements: &mut Vec<HFInline>,
-) {
-    let mut in_field = false;
-    let mut field_inline: Option<HFInline> = None;
-    let mut past_separate = false;
-
-    for child in children {
-        match child {
-            docx_rs::RunChild::FieldChar(fc) => match fc.field_char_type {
-                docx_rs::FieldCharType::Begin => {
-                    in_field = true;
-                    field_inline = None;
-                    past_separate = false;
-                }
-                docx_rs::FieldCharType::Separate => {
-                    past_separate = true;
-                }
-                docx_rs::FieldCharType::End => {
-                    if let Some(inline) = field_inline.take() {
-                        elements.push(inline);
-                    }
-                    in_field = false;
-                    past_separate = false;
-                }
-                _ => {}
-            },
-            docx_rs::RunChild::InstrText(instr) => {
-                if !in_field {
-                    continue;
-                }
-                field_inline = match instr.as_ref() {
-                    docx_rs::InstrText::PAGE(_) => Some(HFInline::PageNumber),
-                    docx_rs::InstrText::NUMPAGES(_) => Some(HFInline::TotalPages),
-                    _ => field_inline,
-                };
-            }
-            docx_rs::RunChild::InstrTextString(s) => {
-                if !in_field {
-                    continue;
-                }
-                // After round-tripping through build/read_docx, InstrText::PAGE
-                // becomes InstrTextString("PAGE"), and NUMPAGES likewise.
-                let trimmed = s.trim();
-                if trimmed.eq_ignore_ascii_case("page") {
-                    field_inline = Some(HFInline::PageNumber);
-                } else if trimmed.eq_ignore_ascii_case("numpages") {
-                    field_inline = Some(HFInline::TotalPages);
-                }
-            }
-            docx_rs::RunChild::Text(t) => {
-                // Skip display values between separate and end
-                if in_field && past_separate {
-                    continue;
-                }
-                if !in_field && !t.text.is_empty() {
-                    elements.push(HFInline::Run(Run {
-                        text: t.text.clone(),
-                        style: style.clone(),
-                        href: None,
-                        footnote: None,
-                    }));
-                }
-            }
-            docx_rs::RunChild::Tab(_) => {
-                if !in_field {
-                    elements.push(HFInline::Run(Run {
-                        text: "\t".to_string(),
-                        style: style.clone(),
-                        href: None,
-                        footnote: None,
-                    }));
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Extract page size and margins from DOCX section properties.
-fn extract_page_setup(section_prop: &docx_rs::SectionProperty) -> (PageSize, Margins) {
-    let size = extract_page_size(&section_prop.page_size);
-    let margins = extract_margins(&section_prop.page_margin);
-    (size, margins)
-}
-
-/// Extract page size from docx-rs PageSize (which has private fields).
-/// Uses serde serialization to access the private `w`, `h`, and `orient` fields.
-/// Values in DOCX are in twips (1/20 of a point).
-/// When orient is "landscape" and width < height, dimensions are swapped to ensure
-/// landscape pages have width > height.
-fn extract_page_size(page_size: &docx_rs::PageSize) -> PageSize {
-    if let Ok(json) = serde_json::to_value(page_size) {
-        let w = json.get("w").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let h = json.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let orient = json.get("orient").and_then(|v| v.as_str());
-        if w > 0.0 && h > 0.0 {
-            let mut width = w / 20.0; // twips to points
-            let mut height = h / 20.0; // twips to points
-            // If orient is landscape but dimensions are portrait-style, swap them
-            if orient == Some("landscape") && width < height {
-                std::mem::swap(&mut width, &mut height);
-            }
-            return PageSize { width, height };
-        }
-    }
-    PageSize::default()
-}
-
-/// Extract margins from docx-rs PageMargin.
-/// PageMargin fields are public i32 values in twips.
-fn extract_margins(page_margin: &docx_rs::PageMargin) -> Margins {
-    Margins {
-        top: page_margin.top as f64 / 20.0,
-        bottom: page_margin.bottom as f64 / 20.0,
-        left: page_margin.left as f64 / 20.0,
-        right: page_margin.right as f64 / 20.0,
     }
 }
 
