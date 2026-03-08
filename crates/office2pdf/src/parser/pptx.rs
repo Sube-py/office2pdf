@@ -18,10 +18,9 @@ use crate::ir::{
 use crate::parser::Parser;
 use crate::parser::smartart;
 
-use self::package::{
-    load_theme, parse_presentation_xml, parse_rels_xml, read_zip_entry, resolve_relative_path,
-    scan_chart_refs,
-};
+use self::package::{load_theme, parse_presentation_xml, parse_rels_xml, read_zip_entry};
+#[cfg(test)]
+use self::package::{resolve_relative_path, scan_chart_refs};
 use self::shapes::{
     parse_group_shape, parse_src_rect, pptx_dash_to_border_style, prst_to_shape_kind,
 };
